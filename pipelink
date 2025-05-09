@@ -821,7 +821,7 @@ function list_jobs {
 		grouped_jobs["$stage"]+="$created_at|$name|$status|$duration"$'\n'
 
 		for check in "${running_states[@]}"; do
-			if [[ "$status" == *"$check" ]]; then
+			if [[ "$status" == *"$check"* ]]; then
 				jobs_running=$(($jobs_running + 1))
 				break
 			fi
