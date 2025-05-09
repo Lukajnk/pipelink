@@ -1,0 +1,953 @@
+#!/usr/bin/env bash
+
+# check if requirements installed
+for app in git curl jq ; do
+    if ! command -v "$app" >/dev/null 2>&1; then
+	echo "Pipelink error: '$app' is required but not installed." >&2
+	exit 1
+    fi
+done
+
+# program variables with default values
+debug_mode="false"
+exec_mode=""
+clear_tag="false"
+link_mode="true"
+monitor_mode="true"
+once_mode="false"
+small_mode="false"
+emoji_mode="false"
+colored_mode="true"
+interval=3
+
+# tags to process argument conflicts
+link_tag="false"
+monitor_tag="false"
+once_tag="false"
+small_tag="false"
+
+# project variables
+project=""			# project name
+token=""			# project token
+directory=""			# project directory
+project_id=""			# gitlab project id
+pipeline_id=""			# gitlab pipeline id
+
+# monitor variables
+found_stages="false"		# flag for parsing stages
+first="true"			# flag for first loop in job status printing
+stages=()			# array to store stages
+previous_stage=""		# variable to know when stage changes in table
+stage_amount=0			# amount of stages in pipeline
+jobs_amount=0			# amount of jobs in pipeline
+running_states=("created" "pending" "running" "waiting_for_resource" "preparing") # states counting as 'running'
+
+# colors
+RESTORE='\033[0m'
+RED='\033[01;31m'
+GREEN='\033[01;32m'
+YELLOW='\033[01;33m'
+BLUE='\033[01;34m'
+PURPLE='\033[01;35m'
+CYAN='\033[01;36m'
+LIGHTGRAY='\033[01;37m'
+colored="${RED}c${YELLOW}o${GREEN}l${CYAN}o${BLUE}r${PURPLE}e${RED}d${RESTORE}"
+
+# filepaths
+config_filepath="$HOME/.config/pipelink"
+config_file="$config_filepath/config"
+projects_file="$config_filepath/projects"
+cache_file="$config_filepath/cache"
+
+# usage function
+function usage {
+	echo ""
+	echo "usage"
+	echo "    pipelink [command] [argument(s)]"
+	echo ""
+	echo "commands"
+	echo "    run               run a project (default command)"
+	echo "    add               add a new project"
+	echo "    list              list all saved projects"
+	echo ""
+	echo "arguments"
+	echo "    -p | --project    [project name]   specify project name"
+	echo "    -t | --token      [access token]   specify personal access token"
+	echo "    -d | --directory  [directory]      specify directory"
+	echo "    -i | --interval   [interval]       specify jobs status refresh interval in seconds"
+	echo "    -l | --link                        only show pipeline URL, skip job status monitoring"
+	echo "    -m | --monitor                     only monitor jobs, skip pipeline URL"
+	echo "    -o | --once                        show job status only once"
+	echo "    -s | --small                       small mode, single line status (only emojis)"
+     echo -e "    -c | --colored                     $colored mode"
+	echo "    -e | --emoji                       emoji mode 🔥"
+	echo "         --clear                       clear screen on start"
+	echo "    -v | --version                     show version"
+	echo "    -h | --help                        show help"
+	echo "         --debug                       show debug info"
+	echo ""
+	echo "    argument can also be set with values, e.g."
+	echo "    --monitor=\"true\" --interval=\"10\" --project=\"batcave\""
+	echo ""
+	echo "    projects are saved in '$projects_file' and"
+	echo "    global default settings can be modified in '$config_file'"
+	echo ""
+}
+
+# debug echo function
+function decho {
+	if [[ "$debug_mode" == "true" && "$@" ]]; then
+		echo "DEBUG: $@"
+	fi
+}
+
+# add project function
+function add_project { # args (force_add)
+
+	decho "entered add_project function"
+
+	# force_add is true by default
+	force_add="true"
+
+	# set 'force_add' if passed
+	[[ "$1" ]] && force_add="$1"
+
+	# if not forced ask user
+	if [[ "$force_add" == "false" ]]; then
+
+		echo -n "add new project? [Y/n]: "
+
+		# loop untill user input valid
+		while :; do
+
+			read choice
+			case "$choice" in
+
+				Y|y|"")
+					break
+					;;
+				N|n)
+					exit
+					;;
+			esac
+			echo -n "invalid input, add new project? [Y/n]: "
+		done
+	fi
+
+	decho "adding new project"
+
+	# get project name if not defined
+	if [[ ! "$project" ]]; then
+		decho "project name not set"
+		echo -n "Project name: "
+		read project
+	else
+		echo "Project name: $project"
+	fi
+
+	# check if project name already taken
+	if [[ $(grep -x "name=$project" "$projects_file") ]]; then
+		echo "Pipelink error: project with that name already exists"
+		exit 1
+	fi
+
+	# get token if not defined
+	if [[ ! "$token" ]]; then
+		decho "token not set"
+		echo -n "Gitlab access token: "
+		read token
+	else
+		echo "token: $token"
+	fi
+
+	# get directory, set pwd if left blank
+	echo -n "Directory (leave blank for current directory '$(pwd)'): "
+	read directory
+
+	if [[ "$directory" == "" ]]; then
+		directory=$(pwd)
+	fi
+
+	# add newline padding if file is not empty
+	if [[ "$(cat "$projects_file")" ]]; then
+		echo "" >> "$projects_file"
+	fi
+
+	# Create project entry in config file
+	echo "name=$project" >> "$projects_file"
+	echo "token=$token" >> "$projects_file"
+	echo "dir=$directory" >> "$projects_file"
+
+	echo "project '$project' added"
+}
+
+# list projects function
+function list_projects {
+
+	decho "listing projects"
+
+	p_name=""
+	p_token=""
+	p_dir=""
+
+	# table header
+	table="name\tdirectory\ttoken\n"
+	table+="----\t---------\t-----\n"
+
+	# go over projects_file line by line
+	while IFS= read -r line; do
+
+		decho "line: $line"
+
+		# parse name
+		if [[ "$line" == name=* ]]; then
+			p_name="${line#name=}"
+
+		# parse token and show only last 5 characters
+		elif [[ "$line" == "token="* ]]; then
+			p_token="glpat-*********"
+			p_token+="${line: -5}"
+
+		# parse directory
+		elif [[ "$line" == "dir="* ]]; then
+			p_dir="${line#dir=}"
+
+			# add row to table
+			table+="$p_name\t$p_dir\t$p_token\n"
+		fi
+
+	done < "$projects_file"
+
+	# print table
+	echo -e "$table" | column -t -s $'\t'
+}
+
+# parse stages function
+function parse_stages {
+
+	# go over .gitlab-ci.yml file line by line
+	while IFS= read -r line; do
+
+		# trim leading/trailing whitespace
+		line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+		# skip comments and empty lines
+		[[ -z "$line" || "$line" =~ ^# ]] && continue
+
+		if [[ "$found_stages" == false ]]; then
+
+			# inline list format
+			if [[ "$line" =~ ^stages:\ *\[ ]]; then
+
+				inline=$(echo "$line" | sed -E 's/stages:\s*\[|\]//g')
+				IFS=',' read -ra parts <<< "$inline"
+
+				for s in "${parts[@]}"; do
+					s=$(echo "$s" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+					[[ "$s" ]] && stages+=("$s")
+				done
+				break
+
+			# multiline format
+			elif [[ "$line" == "stages:" ]]; then
+				found_stages="true"
+			fi
+		else
+			if [[ "$line" =~ ^- ]]; then
+				stage=$(echo "$line" | sed 's/^- *//')
+				stages+=("$stage")
+			else
+				break
+			fi
+		fi
+
+	done < .gitlab-ci.yml
+
+	decho "found stages:"
+	for s in "${stages[@]}"; do
+	    decho " - $s"
+	done
+}
+
+# load default settings file before parsing arguments
+source $config_file
+
+# argument parsing
+while [[ $# -gt 0 ]]; do case "$1" in
+
+	run|add|list)
+		if [[ "$exec_mode" ]]; then
+			echo "Pipelink error: passed multiple mode commands, choose one [run add list remove]"
+			exit 1
+		fi
+		exec_mode="$1"
+		shift
+		;;
+
+	-p|--project)
+		if [[ $# -lt 2 ]]; then
+			echo "Pipelink error: passed '$1' but no project name"
+			exit 1
+		fi
+
+		if [[ "$project" && "$project" != "$2" ]]; then
+			echo "Pipelink error: passed multiple project names"
+			exit 1
+		fi
+
+		project="$2"
+		shift 2
+		;;
+
+	--project=*)
+		value="${1#*=}"
+		project="$value"
+		shift
+		;;
+
+	-t|--token)
+		if [[ $# -lt 2 ]]; then
+			echo "Pipelink error: passed '$1' but no token"
+			exit 1
+		fi
+
+		if [[ "$token" && "$token" != "$2" ]]; then
+			echo "Pipelink error: passed multiple tokens"
+			exit 1
+		fi
+
+		token="$2"
+		shift 2
+		;;
+
+	--token=*)
+		value="${1#*=}"
+		token="$value"
+		shift
+		;;
+
+	-d|--directory)
+		if [[ $# -lt 2 ]]; then
+			echo "Pipelink error: passed '$1' but no directory"
+			exit 1
+		fi
+
+		if [[ "$directory" && "$directory" != "$2" ]]; then
+			echo "Pipelink error: passed multiple directories"
+			exit 1
+		fi
+
+		directory="$2"
+		shift 2
+		;;
+
+	--directory=*)
+		value="${1#*=}"
+		directory="$value"
+		shift
+		;;
+
+	-i|--interval)
+		if [[ $# -lt 2 ]]; then
+			echo "Pipelink error: passed '$1' but no interval period"
+			exit 1
+		fi
+
+		if [[ ! "$interval" =~ ^-?[0-9]+$ ]]; then
+			echo "Pipelink error: interval period '$1' not a number"
+			exit 1;
+		fi
+
+		interval="$2"
+		shift 2
+		;;
+
+	--interval=*)
+		value="${1#*=}"
+		if [[ ! "$value" =~ ^-?[0-9]+$ ]]; then
+			echo "Pipelink error: interval period '$value' not a number"
+			exit 1;
+		fi
+		interval="$value"
+		shift
+		;;
+
+	-l|--link)
+		link_tag="true"
+		link_mode="true"
+		shift
+		;;
+
+	--link=*)
+		value="${1#*=}"
+		if [[ "$value" != "true" && "$value" != "false" ]]; then
+			echo "Pipelink error: invalid input '$1'"
+			exit 1;
+		fi
+		link_tag="$value"
+		link_mode="$value"
+		shift
+		;;
+
+	-m|--monitor)
+		monitor_tag="true"
+		monitor_mode="true"
+		shift
+		;;
+
+	--monitor=*)
+		value="${1#*=}"
+		if [[ "$value" != "true" && "$value" != "false" ]]; then
+			echo "Pipelink error: invalid input '$1'"
+			exit 1;
+		fi
+		monitor_tag="$value"
+		monitor_mode="$value"
+		shift
+		;;
+
+	-o|--once)
+		once_tag="true"
+		once_mode="true"
+		shift
+		;;
+
+	--once=*)
+		value="${1#*=}"
+		if [[ "$value" != "true" && "$value" != "false" ]]; then
+			echo "Pipelink error: invalid input '$1'"
+			exit 1
+		fi
+		once_tag="$value"
+		once_mode="$value"
+		shift
+		;;
+
+	-s|--small)
+		small_mode="true"
+		small_tag="true"
+		shift
+		;;
+
+	--small=*)
+		value="${1#*=}"
+		if [[ "$value" != "true" && "$value" != "false" ]]; then
+			echo "Pipelink error: invalid input '$1'"
+			exit 1
+		fi
+		small_mode="$value"
+		small_tag="$value"
+		shift
+		;;
+
+	-c|--colored)
+		colored_mode="true"
+		shift
+		;;
+
+	--colored=*)
+		value="${1#*=}"
+		if [[ "$value" != "true" && "$value" != "false" ]]; then
+			echo "Pipelink error: invalid input '$1'"
+			exit 1
+		fi
+		colored_mode="$value"
+		shift
+		;;
+
+	-e|--emoji)
+		emoji_mode="true"
+		shift
+		;;
+
+	--emoji=*)
+		value="${1#*=}"
+		if [[ "$value" != "true" && "$value" != "false" ]]; then
+			echo "Pipelink error: invalid input '$1'"
+			exit 1
+		fi
+		emoji_mode="$value"
+		shift
+		;;
+
+	--clear)
+		clear_tag="true"
+		shift
+		;;
+
+	--clear=*)
+		value="${1#*=}"
+		if [[ "$value" != "true" && "$value" != "false" ]]; then
+			echo "Pipelink error: invalid input '$1'"
+			exit 1
+		fi
+		clear_tag="$value"
+		shift
+		;;
+
+	--debug|--verbose)
+		debug_mode="true"
+		shift
+		;;
+
+	-h|--help|help)
+		usage
+		exit
+		;;
+
+	*)
+		echo "Pipelink error: invalid argument '$1'"
+		exit 1
+		;;
+esac ; done
+
+function check_conflicts {
+
+	# check if both link and monitor false
+	if [[ "$link_mode" == "false" && "$monitor_mode" == "false" ]]; then
+		echo "Pipelink error: --link=\"false\" and --monitor\"false\" can not be used together"
+		exit 1
+	fi
+
+	# check for link, monitor and once conflicts
+	if [[ "$link_tag" == "true" ]]; then
+
+		if [[ "$monitor_tag" == "true" ]]; then
+			echo "Pipelink error: --link and --monitor can not be used together"
+			exit 1
+		elif [[ "$once_tag" == "true" ]]; then
+			echo "Pipelink error: --link and --monitor can not be used together"
+			exit 1
+		elif [[ "$small_tag" == "true" ]]; then
+			echo "Pipelink error: --link and --small can not be used together"
+			exit 1
+		fi
+
+		monitor_mode="false"
+		once_mode="false"
+		small_mode="false"
+
+	elif [[ "$monitor_tag" == "true" ]]; then
+
+		link_mode="false"
+	fi
+}
+
+# debug print all variables
+decho "post argument parse state:"
+decho "exec mode    : '$exec_mode'"
+decho "project      : '$project'"
+decho "token        : '$token'"
+decho "directory    : '$directory'"
+decho "monitor_mode : '$monitor_mode'"
+decho "link_mode    : '$link_mode'"
+decho "once_mode    : '$once_mode'"
+decho "small_mode   : '$small_mode'"
+
+
+## get missing variables
+function get_project_variables {
+
+	# if project defined
+	if [[ "$project" ]]; then
+
+		decho "project variable defined '$project'"
+
+		# look for project in project file
+		if [[ $(grep -x "name=$project" "$projects_file") ]]; then
+
+			# get all 3 project lines project file
+			project_lines=$(grep -x -A 2 "name=$project" "$projects_file")
+
+			# parse token and directory
+			token=$(echo "$project_lines" | grep "token=" | sed 's/token=//')
+			directory=$(echo "$project_lines" | grep "dir=" | sed 's/dir=//')
+
+			decho "project found in config file"
+			decho "token set '$token'"
+			decho "directory set '$directory'"
+		else
+
+			# project defined but not found
+			echo "Project '$project' not found"
+
+			force_add="false"
+			add_project $force_add
+		fi
+
+	# if project not defined
+	else
+
+		decho "project variable not defined"
+
+		# check if current directory in config file
+		if [[ ! $(grep -x "dir=$(pwd)" "$projects_file") ]]; then
+
+			echo -n "no project linked to this directory, "
+
+			# ask used to add project
+			add_project "false"
+		else
+
+			# get all 3 values from config file
+			project_lines=$(grep -B 2 -A 1 "dir=$(pwd)" "$projects_file")
+
+			# get project and token
+			project=$(echo "$project_lines" | grep "name=" | sed 's/name=//g' )
+			token=$(echo "$project_lines" | grep "token=" | sed 's/token=//')
+			directory=$(pwd)
+
+			decho "current directory found in config file"
+			decho "project set '$project'"
+			decho "token set '$token'"
+			decho "directory set '$directory'"
+		fi
+	fi
+}
+
+# encode url function
+function urlencode {
+    local string="${1}"
+    local strlen=${#string}
+    local encoded=""
+    local pos c o
+
+    for (( pos=0 ; pos<strlen ; pos++ )); do
+       c=${string:$pos:1}
+       case "$c" in
+	   [-_.~a-zA-Z0-9] ) o="${c}" ;;
+	   * )               printf -v o '%%%02x' "'$c"
+       esac
+       encoded+="${o}"
+    done
+    echo "${encoded}"
+}
+
+# get project_id, pipeline_id and pipeline_url
+function get_pipeline {
+
+	cd "$directory"
+
+	# look for .gitlab.yml file if link_only False
+	if [[ "$monitor_mode" == "true" ]]; then
+		if [[ ! -f ".gitlab-ci.yml" ]]; then
+			echo "no .gitlab-ci.yml found in current directory"
+			exit 1
+		else
+			decho "found .gitlab-ci.yml"
+		fi
+
+		parse_stages
+	fi
+
+	# check if token defined
+	if [[ -z "$token" ]]; then
+	    echo "Pipelink error: gitlab token variable is not set." >&2
+	    exit 1
+	fi
+
+	decho "token defined"
+
+	# get branch
+	branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+	if [[ -z "$branch" ]]; then
+	    echo "Pipelink error: failed to detect branch or not in Git repository'." >&2
+	    exit 1
+	fi
+
+	decho "branch found '$branch'"
+
+	# get remote url
+	remote_url=$(git config --get remote.origin.url)
+	if [[ -z "$remote_url" ]]; then
+	    echo "Pipelink error: no Git remote found." >&2
+	    exit 1
+	fi
+
+	decho "remote url found '$remote_url'"
+
+	# define project path
+	if [[ "$remote_url" == git@* ]]; then
+	    project_path=$(echo "$remote_url" | sed -E 's/git@[^:]+:(.+)\.git/\1/')
+	else
+	    project_path=$(echo "$remote_url" | sed -E 's/https:\/\/[^\/]+\/(.+)\.git/\1/')
+	fi
+
+	decho "project path set '$project_path'"
+
+	# encode project path url
+	encoded_path=$(urlencode "$project_path")
+
+	decho "encoded path set '$encoded_path'"
+
+	# get project id
+	project_id=$(curl -s --header "PRIVATE-TOKEN: $token" "https://gitlab.com/api/v4/projects/$encoded_path")
+	project_id=$(echo $project_id | grep -o '"id":[0-9]*' | sed 's/"id"://' | head -1)
+
+	if [[ -z "$project_id" || "$project_id" == "null" ]]; then
+	    echo "Pipelink error: failed to get project ID for $project_path" >&2
+	    exit 1
+	fi
+
+	decho "project id found '$project_id'"
+
+	# get pipeline id
+	pipeline_id=$(curl -s --header "PRIVATE-TOKEN: $token" "https://gitlab.com/api/v4/projects/$project_id/pipelines?ref=$branch&per_page=1")
+	pipeline_id=$(echo $pipeline_id | grep -o '"id":[0-9]*' | sed 's/"id"://')
+
+	if [[ -z "$pipeline_id" || "$pipeline_id" == "null" ]]; then
+	    echo "Pipelink error: no pipeline found for branch '$branch'" >&2
+	    exit 1
+	fi
+
+	decho "pipeline id found '$pipeline_id'"
+
+	# define pipeline url
+	pipeline_url="https://gitlab.com/$project_path/-/pipelines/$pipeline_id"
+
+	decho "pipeline url set '$pipeline_url'"
+}
+
+# list jobs status table (or emoji list)
+function list_jobs {
+
+	decho "starting list_jobs"
+
+	jobs_json=$(curl -s --header "PRIVATE-TOKEN: $token" "https://gitlab.com/api/v4/projects/$project_id/pipelines/$pipeline_id/jobs" | jq '[.[] | {status, stage, name, created_at, duration, id}]')
+
+	# reset values
+	emoji_list=""
+	previous_stage=""
+	jobs_running=0
+
+	declare -A grouped_jobs
+
+	# group jobs by their stage
+	for job in $(echo "$jobs_json" | jq -c '.[]'); do
+		stage=$(echo "$job" | jq -r '.stage')
+		name=$(echo "$job" | jq -r '.name')
+		status=$(echo "$job" | jq -r '.status')
+		created_at=$(echo "$job" | jq -r '.created_at')
+		duration=$(echo "$job" | jq -r '.duration')
+
+		# count amount of jobs in first loop
+		[[ "$first" == "true" ]] && jobs_amount=$(($jobs_amount + 1))
+
+		case $status in
+			"success")
+				emoji_list=$(echo "✅$emoji_list")
+				[[ "$emoji_mode" == "true" ]] && status="✅ $status"
+				[[ "$colored_mode" == "true" ]] && status="${GREEN}$status${RESTORE}"
+				;;
+			"created")
+				emoji_list=$(echo "📦$emoji_list")
+				[[ "$emoji_mode" == "true" ]] && status="📦 $status"
+				;;
+			"failed")
+				emoji_list=$(echo "❌$emoji_list")
+				[[ "$emoji_mode" == "true" ]] && status="❌ $status"
+				[[ "$colored_mode" == "true" ]] && status="${RED}$status${RESTORE}"
+				;;
+			"pending")
+				emoji_list=$(echo "⌛$emoji_list")
+				[[ "$emoji_mode" == "true" ]] && status="⌛ $status"
+				;;
+			"running")
+				emoji_list=$(echo "🚀$emoji_list")
+				[[ "$emoji_mode" == "true" ]] && status="🚀 $status"
+				[[ "$colored_mode" == "true" ]] && status="${BLUE}$status${RESTORE}"
+				;;
+			"manual")
+				emoji_list=$(echo "✋$emoji_list")
+				[[ "$emoji_mode" == "true" ]] && status="✋ $status"
+				[[ "$colored_mode" == "true" ]] && status="${YELLOW}$status${RESTORE}"
+				;;
+			"scheduled")
+				emoji_list=$(echo "📅$emoji_list")
+				[[ "$emoji_mode" == "true" ]] && status="📅 $status"
+				;;
+			"skipped")
+				emoji_list=$(echo "⏩$emoji_list")
+				[[ "$emoji_mode" == "true" ]] && status="⏩ $status"
+				[[ "$colored_mode" == "true" ]] && status="${LIGHTGRAY}$status${RESTORE}"
+				;;
+			"cancelled")
+				status=" cancelled"
+				emoji_list=$(echo "🚫$emoji_list")
+				[[ "$emoji_mode" == "true" ]] && status="🚫 $status"
+				[[ "$colored_mode" == "true" ]] && status="${ORANGE}$status${RESTORE}"
+				;;
+			"waiting_for_resource")
+				emoji_list=$(echo "🕒$emoji_list")
+				[[ "$emoji_mode" == "true" ]] && status="🕒 $status"
+				;;
+		esac
+
+		grouped_jobs["$stage"]+="$created_at|$name|$status|$duration"$'\n'
+
+		for check in "${running_states[@]}"; do
+			if [[ "$status" == *"$check" ]]; then
+				jobs_running=$(($jobs_running + 1))
+				break
+			fi
+		done
+
+	done
+
+	table="Stage\tName\tStatus\tDuration                                      \n"
+	# table+="==\t=====\t====\t======\t========                                      \n"
+
+	# display the jobs grouped by stage
+	for stage in "${stages[@]}"; do
+
+		[[ "$first" == "true" ]] && stage_amount=$(($stage_amount + 1))
+	    
+		# sort jobs in this stage by created_at
+		sorted_jobs=$(echo -e "${grouped_jobs[$stage]}" | sort)
+
+		# display the sorted jobs for the stage
+		while IFS="|" read -r created_at name status duration; do
+
+			if [[ "$name" ]]; then
+
+				# round duration to 1 decimal
+				if [[ "$duration" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+					duration=$(printf "%.1fs" "$duration")
+				else
+					duration=" -"
+				fi
+
+				table+="$stage\t$name\t$status\t$duration                               \n"
+			fi
+
+		done <<< "$sorted_jobs"
+	done
+
+	# if not first run clear screen
+	if [[ "$first" == "false" ]]; then
+		if [[ "$small_mode" == "true" ]]; then
+			tput cuu 1
+		else
+			tput cuu $(($jobs_amount + 1))
+		fi
+	else
+		# set first flag false
+		first="false"
+	fi
+
+	# print jobs status
+	if [[ "$small_mode" == "true" ]]; then
+		if [[ "$emoji_mode" == "true" ]]; then
+			echo "🏭 Jobs: $emoji_list"
+		else
+			echo "Jobs: $emoji_list"
+		fi
+	else
+		echo -e "$table" | column -t -s $'\t'
+	fi
+
+	if [[ "$jobs_running" == 0 ]]; then
+		if [[ "$emoji_mode" == "true" ]]; then
+			echo "👍🏼 Done with all jobs"
+		else
+			echo "Done with all jobs"
+		fi
+		exit
+	fi
+}
+
+
+# run project function
+function run_project { # args ($force_run, $project)
+
+	# by default run without asking
+	force_run="true"
+
+	# parse force_run if passed
+	[[ "$1" ]] && force_run="$1"
+
+	# if run not forced ask user
+	if [[ "$force_run" == "false" ]]; then
+
+		echo -n "run project '$project'? [Y/n]: "
+
+		# loop untill user input valid
+		while :; do
+
+			read choice
+
+			case "${choice,,}" in
+
+				y|"")
+					break
+					;;
+				n)
+					exit
+					;;
+			esac
+
+			echo -n "invalid input, run project? [Y/n]: "
+		done
+	fi
+
+	get_pipeline
+
+	if [[ "$link_mode" == "true" ]]; then
+		if [[ "$emoji_mode" == "true" ]]; then
+			echo "🔗 Pipeline URL: $pipeline_url"
+		else
+			echo "Pipeline URL: $pipeline_url"
+		fi
+	fi
+
+	[[ "$monitor_mode" == "false" ]] && exit
+
+	if [[ "$once_mode" == "true" ]]; then
+	
+		list_jobs
+		exit
+	else
+		while :; do
+			list_jobs
+			sleep $interval
+		done
+	fi
+
+}
+
+# program start
+
+# set exec_mode to run if not defined
+if [[ ! "$exec_mode" ]]; then
+	exec_mode="run"
+fi
+
+# clear screen
+if [[ "$clear_tag" == "true" ]]; then
+	clear
+fi
+
+# main switch
+case "$exec_mode" in
+
+	run)
+		# check for argument conflicts
+		check_conflicts
+
+		# get all project variables
+		get_project_variables
+
+		# force run project
+		run_project "true" "$project"
+		;;
+	add)
+		# add project then ask user to run
+		add_project
+
+		# ask user to run project
+		run_project "false" "$project"
+		;;
+	list)
+		list_projects
+		;;
+esac
