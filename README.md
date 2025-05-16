@@ -1,34 +1,30 @@
 # Pipelink
 
-Monitor your Gitlab CI/CD pipelines from the terminal. Pipelink is a bash script that fetches real time information about your pipeline jobs using Gitlab's API.
+#### Monitor your Gitlab CI/CD pipelines from the terminal. Pipelink is a bash script that fetches real time information about your pipeline jobs using Gitlab's API.
+<br></br>
+![image info](images/pipelink_1.png)
 
+## 📃 Features
+- #### Monitor pipeline jobs live in the terminal.
+- #### Get a direct URL to the pipeline and jobs of your latest Git push.
+- #### Project configuration saved locally with tokens and directories.
+- #### Optional emoji-based and colored status for clarity at a glance.
 <br></br>
 
-![image info](images/pipelink_3.png)
+## 🔧 Installation
 
-### Features
-- Monitor pipeline jobs live in the terminal.
-- Get a direct URL to the latest pipeline of your current Git branch.
-- Project configuration saved locally with tokens and directories.
-- Optional emoji-based and colored status for clarity at a glance.
+### User install
+    bash <(curl -s https://gitlab.com/lukajnk/pipelink/-/raw/main/install.sh) --user
 
-<br></br>
+### System-wide Install
+    curl -fsSL https://gitlab.com/lukajnk/pipelink/-/raw/main/install.sh | sudo bash
 
-## Installation
-
-### Curl
-    bash <(curl -s https://gitlab.com/lukajnk/pipelink/-/raw/main/install.sh)
-
-### Brew
-    brew tap lukajnk/pipelink
-    brew install pipelink
-
-<br></br>
 ##### Requirements
     bash curl git jq
 
 <br></br>
-## Usage
+
+## 📕 Usage
     pipelink [command] [arguments]
 
     commands
@@ -54,20 +50,16 @@ Monitor your Gitlab CI/CD pipelines from the terminal. Pipelink is a bash script
 
         arguments can also contain values in the form:
         --monitor="true" --interval="10" --project="batcave"
+<br></br>
 
-        projects are saved in '/home/luka/.config/pipelink/projects' and the
-        default settings can be customized in '/home/luka/.config/pipelink/config'
-
-### Config files
+#### Config files
 Projects are saved in `~/.config/pipelink/projects` and global default settings can be changed in the config file `~/.config/pipelink/config`.
 
-
-## Examples
-
 <br></br>
 
-![image info](images/pipelink_1.png)
-
-<br></br>
-
+## 🖼️ Examples
 ![image info](images/pipelink_2.png)
+
+<br></br>
+
+![image info](images/pipelink_3.png)

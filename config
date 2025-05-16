@@ -1,0 +1,16 @@
+# the opposite of the default program settings are shown below
+# so uncommenting will change behaviour
+
+# silent_warning="true"		# hide Pipelink warnings
+# clear_mode="true"		# clears screen on start
+# link_mode="false"		# hides pipeline url
+# monitor_mode="false"		# hides jobs status
+# once_mode="true"		# shows jobs status once and stops
+# small_mode="false"		# single line jobs status with emojis
+# emoji_mode="false"		# enable emojis
+# colored_mode="false"		# disable colors
+<<<<<<< HEAD
+# interval=1			# change jobs status interval period (default is 3)
+=======
+# interval=1			# change jobs status interval period
+>>>>>>> fb9a3dc (some changes)
