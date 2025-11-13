@@ -14,10 +14,10 @@
 ## 🔧 Installation
 
 ### User install
-    bash <(curl -s https://gitlab.com/lukajnk/pipelink/-/raw/main/install.sh) --user
+    sudo bash <(curl -fsSL https://pipelink.jnk.sh/install.sh)
 
 ### System-wide Install
-    curl -fsSL https://gitlab.com/lukajnk/pipelink/-/raw/main/install.sh | sudo bash
+    bash <(curl -fsSL https://pipelink.jnk.sh/install.sh)
 
 ##### Requirements
     bash curl git jq
@@ -49,7 +49,7 @@
              --debug                       show debug info
 
         arguments can also contain values in the form:
-        --monitor="true" --interval="10" --project="batcave"
+        --monitor="true" --interval="10" --project="myapp"
 <br></br>
 
 #### Config files
