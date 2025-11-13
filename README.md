@@ -14,10 +14,10 @@
 ## 🔧 Installation
 
 ### User install
-    sudo bash <(curl -fsSL https://pipelink.jnk.sh/install.sh)
+    bash <(curl -fsSL https://pipelink.jnk.sh/install.sh)
 
 ### System-wide Install
-    bash <(curl -fsSL https://pipelink.jnk.sh/install.sh)
+    sudo bash <(curl -fsSL https://pipelink.jnk.sh/install.sh)
 
 ##### Requirements
     bash curl git jq
