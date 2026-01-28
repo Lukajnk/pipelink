@@ -1,0 +1,16 @@
+# cight global config
+# uncomment to override default settings
+
+# display_clear="true"		# clear terminal on run
+# display_link="true"		# display pipeline url
+# display_gitinfo="true"	# display git info
+# display_monitor="false"	# don't display jobs
+# display_once="true"		# display only once
+# display_small="true"		# display small
+# display_color="false"		# don't display colors
+# display_emoji="true"		# display emojis
+# display_table="true"		# display jobs in table
+# update_interval=1       	# 1 second interval
+# notify="true"			# desktop notification when pipeline done
+# auto_open="true"		# open pipeline in browser when done
+# silent_warnings="true"	# silent warning messages flag

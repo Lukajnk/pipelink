@@ -1,0 +1,2692 @@
+#!/usr/bin/env bash
+
+# developed by Luka Jankovic
+# github    : github.com/Lukajnk
+# portfolio : jnk.sh (curl-able)
+
+# version
+version="1.0.0"
+
+# core variables
+os_name="$(uname -s)"				# os name
+required_apps=(git curl jq)			# dependencies
+program_modes="run/add/list/open/edit/help"	# program modes
+exit_status=""					# exit status
+debug_mode=0					# debug mode flag
+mode=""						# program operation mode
+remote_origin_url=""				# git remote origin url
+
+# local and remote paths
+remote_config_url="https://raw.githubusercontent.com/Lukajnk/cight/1.0.0/config" # remote path for default config file
+user_home="$(eval echo ~${SUDO_USER:-$USER})"	# user home directory
+config_directory="$user_home/.config/cight"	# cight config directory
+projects_file="$config_directory/projects"	# cight projects file
+global_config_file="$config_directory/config"	# user's global config file
+
+# display arguments
+display_link="false"		# display pipeline url
+display_gitinfo="false"		# display git info
+display_monitor="true"		# display jobs
+display_once="false"		# display only once
+display_small="false"		# display small
+display_color="true"		# display colors
+display_emoji="false"		# display emojis
+display_table="false"		# display jobs in table
+display_clear="false"		# clear terminal on run
+update_interval=5       	# jobs monitor interval period
+notify="false"			# desktop notification when pipeline done
+auto_open="false"		# open pipeline in browser when done
+silent_warnings="false"		# silent warning messages flag
+
+# project variables
+name=""				# project name
+directory=""			# project directory
+token=""			# project token
+branch=""			# project branch
+platform=""			# project platform
+
+# commit info
+commit_branch=""
+commit_short_id=""
+commit_title=""
+commit_author=""
+commit_duration=""
+commit_status=""
+
+# github variables
+github_project_id=""		# github project id
+github_pipeline_id=""		# github pipeline id
+github_pipeline_url=""		# github pipeline url
+github_job_url_prefix=""	# github jobs url prefix
+
+# gitlab variables
+gitlab_project_id=""		# gitlab project id
+gitlab_pipeline_id=""		# gitlab pipeline id
+gitlab_pipeline_url=""		# gitlab pipeline url
+
+# monitor variables
+saved_jobs=()			# array of jobs in memory
+stages=()			# array to store stages
+jobs_amount=0			# amount of jobs in pipeline
+
+# status values counting as running
+running_statuses="created/pending/running/waiting_for_resource/preparing"
+
+# empty colors declaration and default colored string, values are changed if colors are supported
+BOLD="" RST="" RED="" YLW="" GRN="" CYN="" BLU="" PRP="" WHT=""
+colored_string="${RED}c${YLW}o${GRN}l${CYN}o${BLU}r${PRP}e${RED}d${RST}" # string in usage
+
+# empty emojis for statuses, changes if display_small or display_emoji enabled
+emoji_success="" emoji_created="" emoji_failed="" emoji_pending="" emoji_running="" emoji_manual=""
+emoji_scheduled="" emoji_skipped="" emoji_canceled="" emoji_waiting_for_resource="" emoji_list=""
+
+# message strings, changes if emoji mode enabled
+commit_branch_message="Branch" commit_title_message="Commit" commit_author_message="Author"
+commit_pushed_message="Pushed" commit_status_message="Status"
+url_message="Pipeline URL" jobs_message="Jobs" done_message="Pipeline done"
+
+### utility functions
+
+function eche {
+	if [[ $# -gt 0 ]]; then
+		echo -e "$*"
+	fi
+}
+
+function dcho {
+	if [[ $# -gt 0 ]] && ((debug_mode)); then
+		echo -e "${BLU}Cight debug${RST}: $*" >&2
+	fi
+}
+
+function bcho {
+	if [[ $# -gt 0 ]]; then
+		echo -e "${BOLD}$*${RST}"
+	fi
+}
+
+function wcho {
+	if [[ $# -gt 0 ]] && [[ "$silent_warnings" == "false" ]]; then
+		local message="$1"
+		message="${message//$'\n'/$'\n'                  }"
+		echo "${YLW}Cight warning${RST}: $message" >&2
+	fi
+}
+
+function err {
+	# show verbose error if debug_mode is enabled
+	if ((debug_mode)); then
+		local func="${FUNCNAME[1]:-main}"
+		local line="${BASH_LINENO[0]}"
+		echo "${RED}Cight Error${RST}, inside $func at line $line: $*" >&2
+	else
+		echo "${RED}Cight Error${RST}: $*" >&2
+	fi
+
+	# exit
+	exit 1
+}
+
+function disable_input {
+	trap 'stty echo icanon; exit 130' SIGINT SIGTERM
+	stty -echo -icanon min 0 time 0
+}
+
+function enable_input {
+	stty echo icanon
+}
+
+function timestamp_to_epoch {
+
+	local timestamp="$1"
+
+	# return if no timestamp passed
+	[[ -z "$timestamp" ]] && return 1
+
+	# linux
+	if [[ "$os_name" == "Linux" ]]; then
+		date -d "$timestamp" +%s
+
+	# macos
+	elif [[ "$os_name" == "Darwin" ]]; then
+
+		if [[ "$timestamp" == *Z ]]; then
+			date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$timestamp" +%s # return
+		else
+			local clean="${timestamp%.*}"
+			local tz_sign="${timestamp##*[0-9]}" && tz_sign="${tz_sign:0:1}"
+			local tz_val="${timestamp##*[-+]}"
+			tz_val="${tz_sign}${tz_val/:/}"
+			date -j -f "%Y-%m-%dT%H:%M:%S%z" "${clean}${tz_val}" +%s # return
+		fi
+
+	# invalid os_name
+	else
+		err "invalid os_name '$os_name'"
+	fi
+}
+
+function format_duration {
+
+	dcho "running format_duration"
+
+	# takes duration in seconds as argument
+	local seconds="$1"
+
+	local minutes hours days duration
+
+	# if seconds is a float turn to int
+	if [[ "$seconds" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+		seconds=${seconds%.*}
+	fi
+
+	# if seconds is not a number return empty duration
+	if [[ ! "$seconds" =~ ^[0-9]+$ ]]; then
+		echo " -"
+		return
+	fi
+
+	# change seconds to minutes and seconds
+	if (( seconds >= 60 )); then
+		minutes=$((seconds / 60))
+		seconds=$((seconds % 60))
+	fi
+
+	# change minutes to hours and minutes
+	if (( minutes >= 60 )); then
+		hours=$((minutes / 60))
+		minutes=$((minutes % 60))
+	fi
+
+	# change hours to days and hours
+	if (( hours >= 24 )); then
+		days=$((hours / 24))
+		hours=$((hours % 24))
+	fi
+
+	# format duration
+	if (( days > 0 )); then
+		duration="${days}d ${hours}h ${minutes}m ${seconds}s"
+
+	elif (( hours > 0 )); then
+		duration="${hours}h ${minutes}m ${seconds}s"
+
+	elif (( minutes > 0 )); then
+		duration="${minutes}m ${seconds}s"
+
+	else
+		duration="${seconds}s"
+	fi
+
+	# return formatted duration
+	echo "$duration"
+}
+
+function clear_line {
+
+	((debug_mode)) && return	# skip line clearing if debug_mode
+
+	local rows=1			# amount of rows to clear, by default 1
+	[[ $# -gt 0 ]] && rows="$1"	# if argument passed set rows to argument
+
+	local cols=$(tput cols)		# amount of characters to clear each row
+
+	# create 'cols' wide spaces string
+	local spaces=""
+	for ((i=0; i<cols; i++)); do
+		spaces+=" "
+	done
+
+	tput cuu $rows			# move cursor up 'rows' rows
+
+	# print spaces string for each row
+	for ((i=0; i<rows; i++)); do
+		echo "$spaces"
+	done
+
+	tput cuu $rows			# move cursor up 'rows' rows again
+}
+
+function show_program_state {
+	dcho "------------------------"
+	dcho "mode      : '$mode'"
+	dcho "name      : '$name'"
+	dcho "directory : '$directory'"
+	dcho "platform  : '$platform'"
+	dcho "token     : '$token'"
+	dcho "branch    : '$branch'"
+	dcho "gitinfo   : '$display_gitinfo'"
+	dcho "once      : '$display_once'"
+	dcho "small     : '$display_small'"
+	dcho "emoji     : '$display_emoji'"
+	dcho "clear     : '$display_clear'"
+	dcho "auto open : '$auto_open'"
+	dcho "link      : '$display_link'"
+	dcho "monitor   : '$display_monitor'"
+	dcho "color     : '$display_color'"
+	dcho "table     : '$display_table'"
+	dcho "notify    : '$notify'"
+	dcho "interval  : '$update_interval'"
+	dcho "success   : '$success'"
+	dcho "------------------------"
+}
+
+### core functions
+
+function check_requirements {
+
+	# missing apps array
+	local missing_apps=()
+
+	# if app in required apps missing add to missing apps
+	for app in "${required_apps[@]}" ; do
+		if ! command -v "$app" >/dev/null 2>&1; then
+			missing_apps+=("$app")
+		fi
+	done
+
+	# if any apps missing throw error
+	if ((${#missing_apps[@]} > 0)); then
+		err "missing apps: ${missing_apps[*]}"
+	fi
+}
+
+function check_files {
+
+	### config directory
+
+	# if directory exists
+	if [[ -d "$config_directory" ]]; then
+
+		dcho "config directory '$config_directory' exists"
+
+		# throw error if failed to set permissions
+		chmod 700 "$config_directory" || \
+			err "config directory '$config_directory' exists but failed to set permissions to '700'"
+
+	# if directory missing
+	else
+		dcho "config directory '$config_directory' missing"
+
+		# throw error if failed creating directory
+		mkdir -p "$config_directory" || \
+			err "config directory '$config_directory' failed to create"
+
+		dcho "config directory '$config_directory' created"
+
+		# throw error if failed to set permissions
+		chmod 700 "$config_directory" || \
+			err "config directory '$config_directory' created but failed to set permissions to '700'"
+
+		# success echo
+		echo "config directory '$config_directory' created with right permissions"
+	fi
+
+	### global config file
+
+	# if file exists
+	if [[ -f "$global_config_file" ]]; then
+
+		dcho "global config file '$global_config_file' exists"
+
+		# throw error if failed to set permissions
+		chmod 600 "$global_config_file" || \
+			err "global config file '$global_config_file' exists but failed to set permissions to '600'"
+
+	# if file missing
+	else
+		dcho "global config file '$global_config_file' missing"
+
+		# throw error if failed creating file
+		touch "$global_config_file" || \
+			err "global config file '$global_config_file' failed to create"
+
+		dcho "global config file '$global_config_file' created"
+
+		# try to curl default remote config from github
+		curl -fsSL "$remote_config_url" -o "$global_config_file" || \
+			wcho "unable to download config file, using empty file as fallback (copy manually from '$remote_config_url')"
+
+		# throw error if failed to set permissions
+		chmod 600 "$global_config_file" || \
+			err "global config file '$global_config_file' created but failed to set permissions to '600'"
+
+		# success echo
+		echo "global config file '$global_config_file' created with right permission"
+	fi
+
+
+	### projects file
+
+	# if file exists
+	if [[ -f "$projects_file" ]]; then
+
+		dcho "projects file '$projects_file' exists"
+
+		# throw error if failed to set permissions
+		chmod 600 "$projects_file" || \
+			err "projects file '$projects_file' exists but failed to set permissions to '600'"
+
+	# if file missing
+	else
+		# throw error if failed creating file
+		touch "$projects_file" || \
+			err "projects file '$projects_file' failed to create"
+
+		# throw error if failed to set permissions
+		chmod 600 "$projects_file" || \
+			err "projects file '$projects_file' created but failed to set permissions to '600'"
+	fi
+}
+
+### usage functions
+
+function usage_main {
+echo "
+${BOLD}Usage${RST}
+    $ cight [command] [arguments]
+
+${BOLD}Commands${RST}
+    run                run a project (default command if project exists in directory)
+    add                add a new project (default command if no project in directory)
+    list               list all saved projects
+    open               open pipeline in browser
+    edit               edit file with default editor
+    help               show help
+
+${BOLD}Project arguments${RST}
+    -d | --directory   [directory]        specify project directory (leaving empty uses working directory)
+    -n | --name        [project name]     specify project name
+    -p | --platform    [gitlab / github]  specify git platform
+    -t | --token       [access token]     specify personal access token
+    -b | --branch      [branch name]      specify branch in project
+
+${BOLD}Display arguments                                                       default value${RST}
+    -C | --clear       [true / false]     clear screen on start         false
+    -l | --link        [true / false]     display pipeline URL          false
+    -g | --gitinfo     [true / false]     show git commit info          false
+    -m | --monitor     [true / false]     display job monitoring        true
+    -o | --once        [true / false]     display jobs only once        false
+    -s | --small       [true / false]     compact emoji mode jobs       false
+    -e | --emoji       [true / false]     emoji mode 🔥                 false
+    -O | --open        [true / false]     open pipeline when done       false
+    -T | --table       [true / false]     show table instead of column  false
+    -N | --notify      [true / false]     desktop notify when done      false
+    -c | --color       [true / false]     $colored_string mode                  true
+    -i | --interval    [seconds]          jobs monitor interval         5 seconds
+
+${BOLD}More help${RST}
+    $ cight help run                   help for running projects
+    $ cight help add                   help for adding new projects
+    $ cight help edit                  help for edit command
+    $ cight help token                 help for obtaining gitlab/github tokens
+"
+}
+
+function usage_run {
+echo "
+${BOLD}Running projects${RST}
+
+    ${BOLD}Name${RST}
+    Projects can be run by specifying a saved project's name. The names of saved projects
+    serve as aliases unique to a combination of the project's directory, platform, token
+    and, optionally, a branch. Project names are the only argument that can be passed
+    without a -n/--name flag, this is why a project's name can't be any of the program
+    modes: [${program_modes}]
+
+        Examples of running a project with the name 'myapp':
+        $ cight myapp
+        $ cight -n myapp
+
+        [--name myapp] and [--name=\"myapp\"] are also valid
+
+    ${BOLD}Directory${RST}
+    Alternatively, projects can be run by specifying a directory. This will fetch all
+    saved projects in the directory and either run it if there is one, or ask the user
+    which to run if there are multiple. Running cight without any specified mode and
+    name will fetch the saved projects in the current working directory
+
+        Examples of fetching saved projects under '/folder' directory
+        $ cight             (executed within '/folder')
+        $ cight -d /folder  (executed anywhere)
+
+        [--directory /folder] and [--directory=\"/folder\"] are also valid
+
+    ${BOLD}Platform${RST}
+    If there are multiple saved projects with different platforms under the same directory,
+    the platform can be specified with -p/--platform. If there is a single project with
+    given combination of directory and platform, this project will be selected, otherwise
+    the user will again be prompted to choose between all projects containing those
+    directory and platform values
+
+        Examples of running a saved GitHub project in the '/folder' directory:
+        $ cight -p github             (executed within '/folder')
+        $ cight -d /folder -p github  (executed anywhere)
+
+        [--platform github] and [--platform=\"github\"] are also valid
+
+    ${BOLD}Branch${RST}
+    If there are multiple saved projects under the same directory and platform, but there
+    are multiple branches, then the branch can be specified with -b/--branch. Projects can
+    also be saved without a specified branch, running those projects by alias will get the
+    active branch and run cight on that branch.
+
+    ${BOLD}More info${RST}
+    $ cight help structure  Show example structure of saved projects
+    $ cight help token      Show how to obtain GitHub/GitLab tokens
+    "
+}
+
+function usage_edit {
+echo "
+location of config files and saved projects file
+    user's saved projects               '\$HOME/.config/cight/projects'
+    user's global config                '\$HOME/.config/cight/config'
+    project's config                    '.cight_config' inside the project directory
+
+edit usage (uses env \$EDITOR, falls back to vim or nano if installed)
+    $ cight edit config              edits project config file in current directory
+    $ cight edit globalconfig        edit global config file
+    $ cight edit projects            edit saved projects file
+"
+}
+
+function usage_structure {
+echo "
+${BOLD}Saved projects example structre${RST}
+
+    projects_file
+     │
+     ├── dir: /projects/forest
+     │   │
+     │   ├── github/
+     │   │   ├── token: ghp_aBc9mL2XQ5pR8nE1vF4wS6dH3j89tD20Y
+     │   │   ├── name: 'forestactive' -> branch: '*'
+     │   │   ├── name: 'forestmain'   -> branch: 'main'
+     │   │   └── name: 'forestfix'    -> branch: 'hotfix/security-fix'
+     │   │
+     │   └── gitlab/
+     │       ├── token: glpat-xa85c9dE2f63hI4jK
+     │       ├── name: 'forestgl'     -> branch: 'main'
+     │       ├── name: 'forestdev'    -> branch: 'develop'
+     │       └── name: 'forestbug'    -> branch: 'bugfix/api-auth'
+     │
+     └── dir: /projects/desert
+         │
+         └── platform: github
+             ├── token: ghp_d7p1qS4xT6uV8wX2yZ9aB3cE5fH7iJ9kL
+             ├── name: 'desert'        -> branch: '*'
+             ├── name: 'desertmain'    -> branch: 'main'
+             └── name: 'desertrelease' -> branch: 'release/v2.0'
+"
+}
+
+function usage_token {
+	echo ""
+	bcho "obtaining GitLab tokens"
+	echo ""
+	echo "    - go to GitLab → settings → access tokens → add new token"
+	echo "    - give the token a name, for example 'cight_token'"
+	echo "    - check the read_api scope"
+	echo "    - click create personal access token"
+	echo "    - copy the token immediately, GitLab will not show it again"
+	echo ""
+}
+
+### input functions
+
+function ask {
+
+	dcho "running ask"
+
+	# check if argument passed
+	[[ $# -lt 1 ]] && err "no arguments passed in ask function"
+
+	local secret=""
+
+	if [[ "$1" == "-s" ]]; then
+		secret="-s"
+		shift
+	fi
+
+	local question="$1"			# get question as argument
+	local answer=""				# answer declaration
+	enable_input				# enable_input
+	read -r $secret -p "$question" answer	# read answer
+	disable_input				# disable input
+	echo "$answer"				# return answer
+
+	#this function did not need comments
+}
+
+### output functions
+
+function print_table {
+
+	# take table as argument
+	local data="$1"
+
+	local line field i width stripped
+	local col_widths=()
+	local rows=()
+
+	local row_count=0
+	local col_count=0
+
+	local table=""
+
+	# parse all rows and calculate max column widths
+	while IFS= read -r line; do
+		rows[$row_count]="$line"
+		i=0
+		IFS=$'\t'
+		for field in $line; do
+
+			# strip ANSI
+			stripped=$(echo "$field" | sed 's/\x1b\[[0-9;]*m//g')
+
+			# get emoji count
+			local emoji_count=$(printf '%s' "$field" | od -An -tx1 | tr ' ' '\n' | grep -E '^(f0|f1|f2|f3|f4|e2|e3|ea|eb|ec|ed|ee|ef)' | wc -l)
+			# set width
+			width=$((${#stripped} + emoji_count))
+
+			# update max width for current column
+			if [[ -z "${col_widths[$i]}" ]] || (( width > col_widths[$i] )); then
+				col_widths[$i]=$width
+			fi
+
+			# increment col_count
+			if (( row_count == 0 )); then
+				((col_count++))
+			fi
+
+			# increment i
+			((i++))
+		done
+
+		# increment row_count
+		((row_count++))
+
+	done <<< "$data"
+
+	# create top, middle and bottom borders
+	local border_top="┌"
+	local border_mid="├"
+	local border_bot="└"
+
+	for ((i=0; i < col_count; i++)); do
+
+		for ((j=0; j < ${col_widths[$i]} + 2; j++)); do
+			border_top+="─"
+			border_mid+="─"
+			border_bot+="─"
+		done
+
+		if (( i < col_count - 1 )); then
+			border_top+="┬"
+			border_mid+="┼"
+			border_bot+="┴"
+		fi
+	done
+
+	border_top+="┐"
+	border_mid+="┤"
+	border_bot+="┘"
+
+	# add top border to table
+	table+="$border_top"$'\n'
+
+	# loop over rows
+	for ((row_num=0; row_num < row_count; row_num++)); do
+
+		local line="${rows[$row_num]}"
+		local formatted_line="│"
+		local column_counter=0
+		IFS=$'\t'
+
+		# loop over fields in line
+		for field in $line; do
+
+			# get max width
+			local width=${col_widths[$column_counter]}
+
+			# format line
+			formatted_line+=" $(printf "%-${width}s" "$field") │"
+
+			# increment column counter
+			((column_counter++))
+		done
+
+		# add formatted line to table
+		table+="$formatted_line"$'\n'
+
+		if (( row_num == 0 )); then
+			# add middle border after header to table
+			table+="$border_mid"$'\n'
+		fi
+	done
+
+	# add bottom border to table
+	table+="$border_bot"$'\n'
+
+	# print table
+	printf "%s" "$table"
+}
+
+function print_columns {
+
+	local data="$1"
+	local line field i width stripped
+	local col_widths=()
+	local rows=()
+	local row_count=0
+	local col_count=0
+	local table=""
+
+	# parse all rows and calculate max column widths
+	while IFS= read -r line; do
+		rows[$row_count]="$line"
+
+		i=0
+		IFS=$'\t'
+		for field in $line; do
+
+			# strip ANSI
+			stripped=$(echo "$field" | sed 's/\x1b\[[0-9;]*m//g')
+
+			# get emoji count
+			local emoji_count=$(printf '%s' "$field" | od -An -tx1 | tr ' ' '\n' | grep -E '^(f0|f1|f2|f3|f4|e2|e3|ea|eb|ec|ed|ee|ef)' | wc -l)
+
+			# set width
+			width=$((${#stripped} + emoji_count))
+
+			# initialize or update max width for this column
+			if [[ -z "${col_widths[$i]}" ]] || (( width > col_widths[$i] )); then
+				col_widths[$i]=$width
+			fi
+
+			# increment col_count
+			if (( row_count == 0 )); then
+				((col_count++))
+			fi
+
+			# increment i
+			((i++))
+		done
+
+		# increment row_count
+		((row_count++))
+
+	done <<< "$data"
+
+	# table variable to be printed
+	local table=""
+
+	# loop over rows
+	for ((row_num=0; row_num < row_count; row_num++)); do
+
+		local line="${rows[$row_num]}"
+		local formatted_line=""
+		local column_counter=0
+		IFS=$'\t'
+
+		# loop over fields in line
+		for field in $line; do
+
+			# get max width
+			local width=${col_widths[$column_counter]}
+
+			# format line
+			formatted_line+="$(printf "%-${width}s" "$field")  "
+
+			# increment column counter
+			((column_counter++))
+		done
+
+		# add leading space, remove trailing space and add newline
+		table+=" ${formatted_line%  }"$'\n'
+	done
+
+	# print table
+	printf "%s" "$table"
+}
+
+function open_url {
+
+	dcho "running open_url"
+
+	# get url as argument
+	local url="$1"
+
+	# return if auto_open is disabled
+	[[ "$auto_open" == "false" && "$mode" != "open" ]] && return
+
+	# open based on os name
+	case "$os_name" in
+		Darwin)
+			open "$url" ;;
+		Linux)
+			xdg-open "$url" ;;
+		*)
+			err "unknown os name '$os_name'" ;;
+	esac
+}
+
+function send_notification {
+
+	# get message as argument
+	local message="$1"
+
+	# return if notification is disabled
+	[[ "$notify" == "false" ]] && return
+
+	# send notification based on os name
+	case "$os_name" in
+		Darwin)
+			osascript -e "display notification \"$message\" with title \"Cight\"" ;;
+		Linux)
+			notify-send "Cight" "$message" ;;
+		*)
+			err "unknown os name '$os_name'" ;;
+	esac
+}
+
+### startup functions
+
+function parse_arguments {
+
+	local expanded_arguments=()
+
+	# loop over all command line arguments
+	for argument in "$@"; do
+
+		# if argument is combined short arguments
+		if [[ "$argument" == -* && "$argument" != --* && ${#argument} -gt 2 ]]; then
+
+			# add all as seperate short arguments to expanded arguments
+			for ((i=1; i<${#argument}; i++)); do
+				expanded_arguments+=("-${argument:$i:1}")
+			done
+
+		# else add to expanded arguments
+		else
+			expanded_arguments+=("$argument")
+		fi
+	done
+
+	# set arguments to expanded arguments
+	set -- "${expanded_arguments[@]}"
+
+	# parse expanded arguments
+	while [[ $# -gt 0 ]]; do case "$1" in
+
+		# run, add and list
+		run|add|list|open)
+			[[ "$mode" ]] && err "invalid input, '$mode' and '$1' cannot be used together, run 'cight help' for usage"
+
+			mode="$1"
+			shift;;
+
+		# edit file
+		edit)
+			[[ "$mode" ]] && err "invalid input, '$mode' and '$1' cannot be used together, run 'cight help' for usage"
+			[[ $# -lt 2 ]] && err "invalid input, passed '$1' without file to edit, run 'cight help' for usage"
+
+			case "$2" in
+				p|projects)	edit_file "$projects_file" ; exit 0;;
+				c|config)	edit_file "$project_config_file" ; exit 0;;
+				g|globalconfig)	edit_file "$global_config_file" ; exit 0;;
+				*)		err "invalid argument '$2' after 'edit', run 'cight help' for usage" ; exit 1;;
+			esac;;
+
+		# all project variables
+		-d|--directory|--directory=*|\
+		-n|--name|--name=*|\
+		-p|--platform|--platform=*|\
+		-t|--token|--token=*|\
+		-b|--branch|--branch=*)
+
+			case "$1" in
+				-n)  key="name" ;;
+				-d)  key="directory" ;;
+				-p)  key="platform" ;;
+				-b)  key="branch" ;;
+				-t)  key="token" ;;
+				--*) key="${1#--}"; key="${key%%=*}" ;;
+			esac
+
+			# get value
+			if [[ "$1" == *=* ]]; then
+				value="${1#*=}"
+			else
+				[[ $# -lt 2 ]] && err "passed '$1' without value"
+				value="$2"
+				shift
+			fi
+
+			# check for multiple different arguments
+			[[ "${!key}" && "${!key}" != "$value" ]] && \
+				err "passed multiple $key arguments"
+
+			# set value
+			eval "$key=\"\$value\""
+			shift;;
+
+		# interval
+		-i|--interval)
+			[[ $# -lt 2 ]] && err "passed '$1' without value"
+			[[ ! "$2" =~ ^-?[0-9]+$ ]] && err "invalid input '$1 $2', interval must be an integer value"
+
+			update_interval="$2"
+			shift 2;;
+
+		--interval=*)
+			[[ ! "${1#*=}" =~ ^-?[0-9]+$ ]] && err "invalid input '$1', interval must be an integer value"
+			update_interval="$value"
+			shift;;
+
+		# all display modes
+		-g|--gitinfo|--gitinfo=*|\
+		-l|--link|--link=*|\
+		-m|--monitor|--monitor=*|\
+		-o|--once|--once=*|\
+		-s|--small|--small=*|\
+		-c|--color|--color=*|\
+		-e|--emoji|--emoji=*|\
+		-T|--table|--table=*|\
+		-C|--clear|--clear=*|\
+		-N|--notify|--notify=*|\
+		-O|--open|--open=*)
+
+			case "$1" in
+				-g)  key="gitinfo" ;;
+				-l)  key="link" ;;
+				-m)  key="monitor" ;;
+				-o)  key="once" ;;
+				-s)  key="small" ;;
+				-c)  key="color" ;;
+				-e)  key="emoji" ;;
+				-T)  key="table" ;;
+				-C)  key="clear" ;;
+				-N)  key="notify" ;;
+				-O)  key="open" ;;
+				--*) key="${1##--}" ;;
+			esac
+
+			# if --arg=value
+			if [[ "$key" == *=* ]]; then
+
+				value="${key#*=}"	# get value
+				key="${key%%=*}"	# get key
+				valid=("true" "false")	# allowed values
+
+				# throw error if value not allowed
+				[[ ! " ${valid[*]} " == *" $value "* ]] && \
+				err "invalid input '$1', $key must be [$(IFS=/; echo "${valid[*]}")]"
+
+			# else if -a or --arg
+			else
+				value="true"
+			fi
+
+			case "$key" in
+				gitinfo) display_gitinfo="$value" ;;
+				link)    display_link="$value" ;;
+				monitor) display_monitor="$value" ;;
+				once)    display_once="$value" ;;
+				small)   display_small="$value" ;;
+				color)   display_color="$value" ;;
+				emoji)   display_emoji="$value" ;;
+				table)   display_table="$value" ;;
+				clear)   display_clear="$value" ;;
+				notify)  notify="$value" ;;
+				open)    auto_open="$value" ;;
+			esac
+			shift;;
+
+		# debug
+		debug|--debug)
+			debug_mode=1
+			shift;;
+
+		# usage
+		-h|--help|help)
+			aestheticize
+
+			if [[ $# -lt 2 ]]; then
+				usage_main
+			else
+				case "$2" in
+					edit)	usage_edit ;;
+					token)	usage_token ;;
+					run)	usage_run ;;
+					add)	usage_add ;;
+				esac
+			fi
+			exit 0;;
+
+		# version
+		-v|--version|version)
+			echo "Cight version: $version"
+			exit 0;;
+
+		# invalid input
+		*)
+			if [[ -z "$name" ]] && grep -qx "\[$1\]" "$projects_file"; then
+				name="$1"
+				shift
+			else
+				err "invalid argument '$1'"
+			fi
+			;;
+
+	esac ; done
+}
+
+function aestheticize {
+
+	# clear screen if display_clear enabled
+	[[ "$display_clear" == "true" ]] && clear
+
+	# if display_color enabled
+	if [[ "$display_color" == "true" ]]; then
+
+		# change color values if colors supported by terminal
+		if [[ -t 1 ]] && tput colors &>/dev/null && [[ $(tput colors) -ge 8 ]]; then
+			BOLD=$'\033[1m'
+			RED=$'\033[01;31m'
+			GRN=$'\033[01;32m'
+			YLW=$'\033[01;33m'
+			BLU=$'\033[01;34m'
+			PRP=$'\033[01;35m'
+			CYN=$'\033[01;36m'
+			WHT=$'\033[01;37m'
+			RST=$'\033[0m'
+		fi
+	fi
+
+	# enable status emojis if display_emoji or display_small enabled
+	if [[ "$display_emoji" == "true" || "$display_small" == "true" ]]; then
+		emoji_success="✅ "
+		emoji_created="📦 "
+		emoji_failed="❌ "
+		emoji_pending="⌛ "
+		emoji_running="🚀 "
+		emoji_manual="✋ "
+		emoji_scheduled="📅 "
+		emoji_skipped="⏩ "
+		emoji_canceled="🚫 "
+		emoji_waiting_for_resource="🕒 "
+	fi
+
+	# add messages emojis if display_emoji enabled
+	if [[ "$display_emoji" == "true" ]]; then
+		commit_branch_message="🌿 ${commit_branch_message}"
+		commit_title_message="📝 ${commit_title_message}"
+		commit_author_message="🙂 ${commit_author_message}"
+		commit_pushed_message="⏳ ${commit_pushed_message}"
+		commit_status_message="❔ ${commit_status_message}"
+		url_message="🔗 $url_message"
+		jobs_message="🏭 $jobs_message"
+		done_message="👍🏼 $done_message"
+	fi
+
+	# overwrite status strings
+	success="${emoji_success}${GRN}success${RST}"
+	created="${emoji_created}${WHT}created${RST}"
+	failed="${emoji_failed}${RED}failed${RST}"
+	pending="${emoji_pending}${YLW}pending${RST}"
+	running="${emoji_running}${BLU}running${RST}"
+	manual="${emoji_manual}${YLW}manual${RST}"
+	scheduled="${emoji_scheduled}${WHT}scheduled${RST}"
+	skipped="${emoji_skipped}${WHT}skipped${RST}"
+	cancelled="${emoji_canceled}${PRP}cancelled${RST}"
+	waiting_for_resource="${emoji_waiting_for_resource}${WHT}waiting_for_resource${RST}"
+	colored_string="${RED}c${YLW}o${GRN}l${CYN}o${BLU}r${PRP}e${RED}d${RST}" # string in --help
+}
+
+### add / list / edit
+
+function list_projects {
+
+	dcho "running list_projects"
+
+	local name=""
+	local directory=""
+	local platform=""
+	local token=""
+	local branch=""
+
+	# table header
+	local table="Name"$'\t'"Directory"$'\t'"Platform"$'\t'"Token"$'\t'"Branch"$'\n'
+
+	# go over projects_file line by line
+	while IFS= read -r line; do
+
+		# get name
+		if [[ "$line" == "["*"]" ]]; then
+			name="${line//[\[\]]/}"
+
+		# get directory
+		elif [[ "$line" == "dir = "* ]]; then
+			directory="${line#dir = }"
+
+		# get platform
+		elif [[ "$line" == "platform = "* ]]; then
+			platform="${line#platform = }"
+
+		# get token and show only last 5 characters
+		elif [[ "$line" == "token = "* ]]; then
+			token="...${line: -5}"
+
+		# get branch
+		elif [[ "$line" == "branch = "* ]]; then
+			branch="${line#branch = }"
+
+			# add row to table
+			table+="$name"$'\t'"$directory"$'\t'"$platform"$'\t'"$token"$'\t'"$branch"$'\n'
+		fi
+
+	done < "$projects_file"
+
+	# remove trailing newline
+	table="${table%$'\n'}"
+
+	# display table
+	if [[ "$display_table" == "true" ]]; then
+		print_table "$table"
+	else
+		print_columns "$table"
+	fi
+}
+
+function add_project {
+
+	dcho "running add_project"
+
+	echo "adding new project"
+
+	# count amount of lines to clear at end
+	local line_counter=0
+
+	### directory
+
+	echo "" # spacing
+
+	# get directory if not passed as argument
+	if [[ -z "$directory" ]]; then
+		directory=$(ask "enter directory (leave empty for current directory): ")
+		clear_line
+	fi
+
+	# loop untill directory is valid
+	while :; do
+
+		# if input set pwd as directory
+		if [[ "$directory" == "" ]]; then
+			directory=$(pwd)
+
+		# check if directory missing
+		elif [[ ! -d "$directory" ]]; then
+			directory=$(ask "'$directory' does not exist, enter directory (leave empty for current directory): ")
+			clear_line
+
+		# directory valid
+		else
+			break
+		fi
+	done
+
+	# remove trailing '/' from directory path
+	directory=$(realpath "${directory%/}")
+
+	# optional message
+	local directory_message=""
+
+	# check if '.git' is missing
+	if [[ ! -d "$directory/.git" ]]; then
+		directory_message="  ${YLW}Warning${RST}: '.git' directory missing, possibly wrong directory selected"
+	fi
+	
+	clear_line # remove spacing
+
+	# show directory
+	echo "directory : $directory $directory_message"
+
+	# increment line_counter
+	((line_counter++))
+
+	### platform
+
+	echo "" # spacing
+
+	# get platform if not passed as argument
+	if [[ ! "$platform" ]]; then
+		platform=$(ask "enter platform [github(h)/gitlab(l)]: ")
+		clear_line
+	fi
+
+	# loop untill platform is valid
+	while :; do
+
+		# normalize aliases
+		if [[ "$platform" == "hub" || "$platform" == "h" ]]; then
+			platform="github"
+		elif [[ "$platform" == "lab" || "$platform" == "l" ]]; then
+			platform="gitlab"
+		fi
+
+		# check if platform invalid
+		if [[ "$platform" != "github" && "$platform" != "gitlab" ]]; then
+			platform=$(ask "invalid input '$platform', enter platform [github(h)/gitlab(l)]: ")
+			clear_line
+
+		# platform valid
+		else
+			break
+		fi
+	done
+
+	# optional message
+	local platform_message=""
+
+	# check if workflows dir missing for github project
+	if [[ "$platform" == "github" ]] && [[ ! -d "${directory}/.github/workflows" ]]; then
+		platform_message="  ${YLW}Warning${RST}: '.github/workflows' directory missing, possibly wrong platform selected"
+
+	# check if gitlab-ci.yml missing for gitlab project
+	elif [[ "$platform" == "gitlab" ]] && [[ ! -f "${directory}/.gitlab-ci.yml" ]]; then
+		platform_message="  ${YLW}Warning${RST}: '.gitlab-ci.yml' file missing, possible wrong platform selected"
+	fi
+	
+	clear_line # remove spacing
+
+	# show platform
+	echo "platform  : $platform $platform_message"
+
+	# increment line_counter
+	((line_counter++))
+
+	### token
+
+	echo "" # spacing
+	
+	local existing_token=""
+
+	# get token if not defined
+	if [[ ! "$token" ]]; then
+
+		# look for project with same directory and platform to get token
+		existing_token=$(grep -x -A3 "dir = $directory" "$projects_file" | grep -A2 "platform = $platform" | grep "token = " | head -1)
+
+		# set token to existing_token if found
+		if [[ -n "$existing_token" ]]; then
+			token="${existing_token#token = }"
+
+		# ask for token if not found
+		else
+			token=$(ask -s "gitlab access token: ")
+			clear_line
+		fi
+	fi
+
+	# check token validity
+	while :; do
+
+		# check token does not start with 'glpat-' or 'glpt-'
+		if [[ ! "$token" =~ ^glp(at|t)- ]]; then
+			token=$(ask -s "invalid access token, run 'cight --help' for instructions or try again: ")
+			clear_line
+
+		else
+
+			echo "validating token..."
+
+			# curl with token
+			local test_curl=$(curl -s --header "PRIVATE-TOKEN: $token" "https://gitlab.com/api/v4/user")
+
+			# if curl response shows token is invalid
+			if ! echo "$test_curl" | jq -e '.id' >/dev/null 2>&1; then
+				clear_line
+				token=$(ask -s "access token rejected by GitLab, try again: ")
+				clear_line
+			else
+				clear_line
+				break # valid
+			fi
+		fi
+	done
+
+	# optional message
+	local token_message=""
+
+	# add found message if existing_token found
+	if [[ -n "$existing_token" ]]; then
+		token_message="(found project with directory and platform)"
+	fi
+
+	clear_line # remove spacing
+
+	# show token
+	echo "token     : ...${token: -5} ${GRN}validated${RST} $token_message"
+
+	# increment line_counter
+	((line_counter++))
+
+	### branch
+
+	echo "" # spacing
+
+	# get branch if not defined
+	if [[ ! "$branch" ]]; then
+		branch=$(ask "branch name (or @ for active branch): ")
+		clear_line
+	fi
+
+	# check branch validity
+	while :; do
+
+		# @ passed
+		if [[ "$branch" == "@" ]]; then
+			break
+
+		# invalid name
+		elif \
+		[[ -z "$branch" ]] \
+		|| [[ ! "$branch" =~ ^[a-zA-Z0-9/_.-]+$ ]] \
+		|| [[ "$branch" =~ ^[/.] ]] \
+		|| [[ "$branch" =~ [/.]$ ]] \
+		|| [[ "$branch" == *..* ]] \
+		|| [[ "$branch" == *@\{* ]] \
+		|| [[ "$branch" == *.lock ]]; then
+
+			branch=$(ask "invalid branch name '$branch', enter branch name (or @ for active branch): ")
+			clear_line
+
+		# valid name
+		else
+			break
+		fi
+	done
+
+	clear_line # remove spacing
+
+	local branch_message=""
+
+	# add active directory to branch message if branch is '@'
+	if [[ "$branch" == "@" ]]; then
+		branch_message="(active directory)"
+	fi
+
+	# show branch
+	echo "branch    : $branch $branch_message"
+
+	# increment line_counter
+	((line_counter++))
+
+	# look for existing project with same directory, platform and branch
+	existing_project=$(grep -x -A4 -B1 "dir = $directory" "$projects_file" \
+		| grep -A3 -B2 "platform = $platform" \
+		| grep -B4 "branch = $branch" \
+		| grep '^\[' \
+		| head -1)
+
+	existing_project="${existing_project//[\[\]]/}"
+
+	if [[ -n "$existing_project" ]]; then
+		wcho "project with same directory, platform and branch already exists under the name '$existing_project'
+consider renaming exisisting projects with 'cight rename' or 'cight edit project'"
+
+		# increment line_counter by 2
+		((line_counter+=2))
+	fi
+
+	### name
+
+	echo "" # spacing
+
+	# get project name if not passed as argument
+	if [[ -z "$name" ]]; then
+		name=$(ask "project name: ")
+		clear_line
+	fi
+
+	# loop untill name is valid
+	while :; do 
+
+		# check if empty string
+		if [[ -z "$name" ]]; then
+			name=$(ask "invalid input, project name can't be empty, enter project name: ")
+			clear_line
+
+		# check if name contains brackets
+		elif [[ "$name" =~ [\[\]] ]]; then
+			name=$(ask "invalid input, project name can't contain the following characters '[]', enter project name: ")
+			clear_line
+		
+		# check if already in use
+		elif grep -qxF "[$name]" "$projects_file"; then
+			name=$(ask "project with name '$name' already in use, project name: ")
+			clear_line
+
+		# check if name is a cight run mode
+		elif [[ "/${program_modes}/" == *"/$name/"* ]]; then
+			name=$(ask "invalid input, project name can't be a cight program mode [${program_modes}], enter project name: ")
+			clear_line
+
+		# break if name valid
+		else
+			break
+		fi
+	done
+
+	clear_line # remove spacing
+
+	# show name
+	echo "name      : $name"
+
+	# increment line_counter
+	((line_counter++))
+
+	### save project
+
+	# add project lines to project file
+	{
+		echo ""
+		echo "[$name]"
+		echo "dir = $directory"
+		echo "platform = $platform"
+		echo "token = $token"
+		echo "branch = $branch"
+	} >> "$projects_file"
+
+	### ask to run project
+
+	echo "" # spacing
+
+	# ask user input
+	run_project=$(ask "'$name' added, run project? [Y/n]: ")
+	clear_line
+
+	# loop untill user input valid
+	while :; do case "$run_project" in
+		[Yy]|[Yy][Ee][Ss]|"")	break ;;
+		[Nn]|[Nn][Oo])		exit 0 ;;
+		*)			run_project=$(ask "invalid input, run project? [Y/n]: ")
+	esac ; done
+
+	# clear lines
+	clear_line $((line_counter + 2))
+}
+
+function edit_file {
+
+	# take file as argument
+	local file="$1"
+
+	# get $EDITOR and remove potential arguments
+	editor_cmd=$(echo '%s' "$EDITOR" | awk '{print $1}')
+
+	# check if $EDITOR set
+	if [[ -n "$editor_cmd" ]]; then
+		dcho "default editor is set '$editor_cmd'"
+
+		# check if default editor installed
+	       	if command -v "$editor_cmd" >/dev/null 2>&1; then
+
+			dcho "default editor '$editor_cmd' is installed"
+
+			# open file with $EDITOR
+			"$editor_cmd" "$file"
+			exit 0
+
+		# $EDITOR set but not installed
+		else
+			wcho "default editor '$editor_cmd' exists but is not installed, trying fallback editors"
+		fi
+
+	# no $EDITOR set
+	else
+		dcho "no '\$EDITOR' found"
+	fi
+
+	# check if vim installed
+	if command -v vim >/dev/null 2>&1; then
+
+		dcho "vim is installed, using as editor"
+
+		# open file with vim
+		vim "$file"
+		exit 0
+	fi
+
+	# check if nano installed
+	if command -v nano >/dev/null 2>&1; then
+
+		dcho "nano is installed, using as editor"
+
+		# open file with nano
+		nano "$file"
+		exit 0
+	fi
+
+	# throw error if nothing works
+	err "no text editor found. install vim or nano, set the \$EDITOR environment variable or manually edit file"
+}
+
+### GitHub functions
+
+function parse_github_workflows {
+
+	dcho "running parse_github_workflows"
+
+	local workflows_dir="$directory/.github/workflows"
+
+	# check if workflows directory exists
+	if [[ ! -d "$workflows_dir" ]]; then
+		err "'.github/workflows' directory not found"
+	fi
+
+	# parse all yaml/yml files in workflows directory
+	for workflow_file in "$workflows_dir"/*.yml "$workflows_dir"/*.yaml; do
+
+		# skip if no files found (glob didn't match)
+		[[ ! -f "$workflow_file" ]] && continue
+
+		dcho "parsing workflow file: $workflow_file"
+
+		local in_jobs_section=0
+
+		while IFS= read -r line; do
+
+			# skip empty lines and comments
+			[[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+
+			# check if we're entering jobs section
+			if [[ "$line" =~ ^jobs:[[:space:]]*$ ]]; then
+				in_jobs_section=1
+				continue
+			fi
+
+			# if in jobs section
+			if ((in_jobs_section)); then
+
+				# check if line starts a new top-level section (no indent)
+				if [[ "$line" =~ ^[a-zA-Z_][a-zA-Z0-9_-]*: && ! "$line" =~ ^[[:space:]] ]]; then
+					in_jobs_section=0
+					continue
+				fi
+
+				# job names are at 2-space indent (direct children of jobs:)
+				if [[ "$line" =~ ^[[:space:]][[:space:]][a-zA-Z_][a-zA-Z0-9_-]*:[[:space:]]*$ ]]; then
+					local job_name="${line#"${line%%[![:space:]]*}"}"
+					job_name="${job_name%:*}"
+					echo "$job_name"
+					dcho "found job: $job_name"
+				fi
+			fi
+
+		done < "$workflow_file"
+	done
+}
+
+function get_github_pipeline_url {
+
+	dcho "running get_github_pipeline_url"
+
+	# get remote_origin_url if missing
+	[[ -z "$remote_origin_url" ]] && get_remote_origin_url
+
+	# get github_pipeline_id if missing
+	[[ -z "$github_pipeline_id" ]] && get_github_pipeline_id
+
+	# define github_pipeline_url
+	github_pipeline_url="https://github.com/$remote_origin_url/actions/runs/$github_pipeline_id"
+
+	dcho "github_pipeline_url set: '$github_pipeline_url'"
+}
+
+function get_github_project_id {
+
+	dcho "running get_github_project_id"
+
+	# if remote_origin_url not defined, get it first
+	if [[ -z "$remote_origin_url" ]]; then
+		get_remote_origin_url
+	fi
+
+	# curl project
+	local project_json=$(curl -s --header "Authorization: Bearer $token" "https://api.github.com/repos/$remote_origin_url")
+
+	# parse project_id from json
+	github_project_id=$(echo "$project_json" | jq -r '.id // ""')
+
+	# check if project_id found
+	if [[ -z "$github_project_id" || "$github_project_id" == "null" ]]; then
+
+		# show json error message and throw error
+		local json_error=$(echo "$project_json" | jq -r '.message')
+		err "project json curl error: '$json_error'"
+	fi
+
+	dcho "project id found '$github_project_id'"
+}
+
+function get_github_pipeline_id {
+
+	dcho "running get_github_pipeline_id"
+
+	# if branch is none, get active branch
+	[[ "$branch" == "@" ]] && set_active_branch
+
+	# curl latest workflow run for branch
+	local runs_json=$(curl -s --header "Authorization: Bearer $token" "https://api.github.com/repos/$remote_origin_url/actions/runs?branch=$branch&per_page=1")
+
+	# parse github_pipeline_id
+	github_pipeline_id=$(echo "$runs_json" | jq -r '.workflow_runs[0].id // ""')
+
+	# check if pipeline id found
+	if [[ -z "$github_pipeline_id" || "$github_pipeline_id" == "null" ]]; then
+		err "no workflow run found for branch '$branch'"
+	fi
+
+	dcho "github_pipeline_id set: '$github_pipeline_id'"
+
+	# define github_job_url_prefix
+	github_job_url_prefix="https://github.com/$remote_origin_url/actions/runs/$github_pipeline_id/job/"
+}
+
+function get_github_commit_info {
+
+	dcho "running get_github_commit_info"
+
+	# get workflow run details
+	local run_json=$(curl -s --header "Authorization: Bearer $token" "https://api.github.com/repos/$remote_origin_url/actions/runs/$github_pipeline_id" 2>/dev/null)
+
+	commit_branch=$(echo "$run_json" | jq -r '.head_branch' 2>/dev/null)
+	commit_short_id=$(echo "$run_json" | jq -r '.head_sha[:7]' 2>/dev/null)
+	commit_title=$(echo "$run_json" | jq -r '.display_title' 2>/dev/null)
+	commit_author=$(echo "$run_json" | jq -r '.actor.login' 2>/dev/null)
+	commit_created=$(echo "$run_json" | jq -r '.created_at' 2>/dev/null)
+	commit_status=$(echo "$run_json" | jq -r '.status' 2>/dev/null)
+
+	# get conclusion if completed
+	local conclusion=$(echo "$run_json" | jq -r '.conclusion // ""' 2>/dev/null)
+	if [[ -n "$conclusion" && "$conclusion" != "null" ]]; then
+		commit_status="$conclusion"
+	fi
+
+	# convert to epoch
+	local commit_timestamp=$(timestamp_to_epoch "$commit_created")
+
+	# get elapsed time in seconds and format
+	local seconds=$(($(date +%s) - commit_timestamp))
+	commit_pushed=$(format_duration "$seconds")
+}
+
+function github_pipeline_init {
+
+	dcho "running github_pipeline_init"
+
+	# running jobs counter
+	local pipeline_running=0
+
+	# get workflow job names as placeholders
+	local workflow_jobs=""
+	workflow_jobs=$(parse_github_workflows)
+
+	# store workflow job names for matching
+	local workflow_job_list=""
+
+	# add placeholder jobs from workflow files
+	while IFS= read -r job_name; do
+
+		[[ -z "$job_name" ]] && continue
+
+		# format job as placeholder (no id, no started_at, pending status, no duration)
+		local job="-|-|$job_name|-|pending|-"
+
+		# save job to jobs_saved
+		jobs_saved+="${job}\n"
+
+		# save job name for matching
+		workflow_job_list+="${job_name}\n"
+
+		# placeholder jobs count as running
+		pipeline_running=1
+
+	done <<< "$workflow_jobs"
+
+	# jobs json from api
+	local jobs_json=$(curl -s --header "Authorization: Bearer $token" "https://api.github.com/repos/$remote_origin_url/actions/runs/$github_pipeline_id/jobs" 2>/dev/null)
+
+	dcho "jobs_json received"
+
+	# parse json data and update matching placeholders
+	while IFS=$'\t' read -r id name started_at completed_at status conclusion; do
+
+		[[ -z "$id" || "$id" == "null" ]] && continue
+
+		# map github status to unified status
+		local mapped_status=""
+		if [[ "$status" == "completed" ]]; then
+			case "$conclusion" in
+				success)	mapped_status="success" ;;
+				failure)	mapped_status="failed" ;;
+				cancelled)	mapped_status="cancelled" ;;
+				skipped)	mapped_status="skipped" ;;
+				*)		mapped_status="${conclusion:-unknown}" ;;
+			esac
+		else
+			case "$status" in
+				queued)		mapped_status="pending" ;;
+				in_progress)	mapped_status="running" ;;
+				waiting)	mapped_status="waiting_for_resource" ;;
+				*)		mapped_status="${status:-pending}" ;;
+			esac
+		fi
+
+		# calculate duration from timestamps
+		local duration="-"
+		if [[ "$started_at" =~ ^[0-9]{4}- ]]; then
+			local start_epoch=$(timestamp_to_epoch "$started_at")
+			local end_epoch=""
+
+			if [[ "$completed_at" =~ ^[0-9]{4}- ]]; then
+				end_epoch=$(timestamp_to_epoch "$completed_at")
+			else
+				end_epoch=$(date +%s)
+			fi
+
+			local duration_seconds=$((end_epoch - start_epoch))
+			((duration_seconds < 0)) && duration_seconds=0
+			duration=$(format_duration "$duration_seconds")
+		fi
+
+		# check if any job is running
+		[[ "/$running_statuses/" == *"/$mapped_status/"* ]] && pipeline_running=1
+
+		# format job (github has no stages, use - as placeholder)
+		local job="$id|-|$name|$started_at|$mapped_status|$duration"
+
+		# check if job name exists in workflow placeholders
+		if echo "$workflow_job_list" | grep -qx "$name"; then
+			# replace placeholder with api data
+			local old_pattern="-|-|$name|-|pending|-"
+			jobs_saved="${jobs_saved//$old_pattern/$job}"
+		else
+			# add new job (matrix jobs, dynamic jobs, etc)
+			jobs_saved+="${job}\n"
+		fi
+
+	done < <(echo "$jobs_json" | jq -r '.jobs[] | [
+		.id,
+		.name,
+		(.started_at // ""),
+		(.completed_at // ""),
+		.status,
+		(.conclusion // "")
+	] | @tsv' 2>/dev/null)
+
+	# check if any placeholder jobs remain (count as running)
+	if echo "$jobs_saved" | grep -q "^-|-|.*|-|pending|-$"; then
+		pipeline_running=1
+	fi
+
+	# build emoji list from jobs_saved
+	if [[ "$display_small" == "true" ]]; then
+		emoji_list=""
+		while IFS='|' read -r id stage name started_at status duration; do
+			[[ -z "$name" ]] && continue
+			local emoji_var="emoji_${status}"
+			emoji_list="${!emoji_var}${emoji_list}"
+		done <<< "$(eche "$jobs_saved")"
+	fi
+
+	# sort jobs by started_at (4th field), placeholders (-) sort first
+	jobs_saved=$(eche "$jobs_saved" | sort -t'|' -k4,4)
+
+	# remove trailing newline
+	jobs_saved="${jobs_saved#$'\n'}"
+
+	# count jobs
+	jobs_amount=$(echo "$jobs_saved" | grep -c .)
+
+	# get workflow run status
+	local run_status=$(curl -s --header "Authorization: Bearer $token" \
+		"https://api.github.com/repos/$remote_origin_url/actions/runs/$github_pipeline_id" | \
+		jq -r 'if .status == "completed" then .conclusion else .status end')
+
+	exit_status="$run_status"
+
+	return $pipeline_running
+}
+
+function github_pipeline_update {
+
+	dcho "running github_pipeline_update"
+
+	# reset jobs running counter
+	local pipeline_running=0
+
+	# reset emoji list
+	emoji_list=""
+
+	# get jobs json
+	local jobs_json=$(curl -s --header "Authorization: Bearer $token" "https://api.github.com/repos/$remote_origin_url/actions/runs/$github_pipeline_id/jobs" 2>/dev/null)
+
+	dcho "jobs_json received"
+
+	# parse json data and update jobs_saved
+	while IFS=$'\t' read -r job_id name started_at completed_at job_status job_conclusion; do
+
+		[[ -z "$job_id" || "$job_id" == "null" ]] && continue
+
+		# map github status to unified status
+		local mapped_status=""
+		if [[ "$job_status" == "completed" ]]; then
+			case "$job_conclusion" in
+				success)	mapped_status="success" ;;
+				failure)	mapped_status="failed" ;;
+				cancelled)	mapped_status="cancelled" ;;
+				skipped)	mapped_status="skipped" ;;
+				*)		mapped_status="${job_conclusion:-unknown}" ;;
+			esac
+		else
+			case "$job_status" in
+				queued)		mapped_status="pending" ;;
+				in_progress)	mapped_status="running" ;;
+				waiting)	mapped_status="waiting_for_resource" ;;
+				*)		mapped_status="${job_status:-pending}" ;;
+			esac
+		fi
+
+		# calculate duration from timestamps
+		local job_duration="-"
+		if [[ "$started_at" =~ ^[0-9]{4}- ]]; then
+			local start_epoch=$(timestamp_to_epoch "$started_at")
+			local end_epoch=""
+
+			if [[ "$completed_at" =~ ^[0-9]{4}- ]]; then
+				end_epoch=$(timestamp_to_epoch "$completed_at")
+			else
+				end_epoch=$(date +%s)
+			fi
+
+			local duration_seconds=$((end_epoch - start_epoch))
+			((duration_seconds < 0)) && duration_seconds=0
+			job_duration=$(format_duration "$duration_seconds")
+		fi
+
+		# check if any job is running
+		[[ "/$running_statuses/" == *"/$mapped_status/"* ]] && pipeline_running=1
+
+		# format new job
+		local new_job="$job_id|-|$name|$started_at|$mapped_status|$job_duration"
+
+		# check if this is a placeholder job (starts with -|-|name|)
+		local placeholder_pattern="-|-|$name|-|pending|-"
+		if echo "$jobs_saved" | grep -q "^$placeholder_pattern$"; then
+			# replace placeholder with api data
+			jobs_saved="${jobs_saved//$placeholder_pattern/$new_job}"
+		else
+			# update existing job by id
+			local old_job=$(echo "$jobs_saved" | grep "^$job_id|")
+			if [[ -n "$old_job" ]]; then
+				jobs_saved="${jobs_saved//$old_job/$new_job}"
+			fi
+		fi
+
+	done < <(echo "$jobs_json" | jq -r '.jobs[] | [
+		.id,
+		.name,
+		(.started_at // ""),
+		(.completed_at // ""),
+		.status,
+		(.conclusion // "")
+	] | @tsv' 2>/dev/null)
+
+	# check if any placeholder jobs remain (count as running)
+	if echo "$jobs_saved" | grep -q "^-|-|.*|-|pending|-$"; then
+		pipeline_running=1
+	fi
+
+	# build emoji list from jobs_saved
+	if [[ "$display_small" == "true" || "$notify" == "true" ]]; then
+		while IFS='|' read -r id stage name started_at status duration; do
+			[[ -z "$name" ]] && continue
+			local emoji_var="emoji_${status}"
+			emoji_list="${!emoji_var}${emoji_list}"
+		done <<< "$(eche "$jobs_saved")"
+	fi
+
+	# sort jobs
+	jobs_saved=$(eche "$jobs_saved" | sort -t'|' -k4,4)
+
+	# get workflow run status
+	local run_status=$(curl -s --header "Authorization: Bearer $token" \
+		"https://api.github.com/repos/$remote_origin_url/actions/runs/$github_pipeline_id" | \
+		jq -r 'if .status == "completed" then .conclusion else .status end')
+
+	exit_status="$run_status"
+
+	return "$pipeline_running"
+}
+
+function monitor_github_pipeline {
+
+	local first_run=0
+	local pipeline_running=0
+
+	# if jobs_saved is empty set first_run flag
+	if [[ -z "$jobs_saved" ]]; then
+		first_run=1
+	fi
+
+	dcho "running monitor_github_pipeline"
+
+	# if first run
+	if ((first_run)); then
+
+		# get initial github jobs data
+		github_pipeline_init
+	else
+		# update github jobs data
+		github_pipeline_update
+	fi
+
+	pipeline_running=$?
+
+	# update jobs_amount
+	jobs_amount=$(echo "$jobs_saved" | grep -c .)
+
+	# add header to table
+	table_rows="Name"$'\t'"Status"$'\t'"Duration"$'\t'"URL"$'\n'
+
+	# display_small mode
+	if [[ "$display_small" == "true" ]]; then
+
+		# clear single line
+		if ((!debug_mode)) && ((!first_run)); then
+			tput cuu 1
+		fi
+
+		# show single line job list
+		echo " $jobs_message: $emoji_list"
+
+	# normal mode
+	else
+
+		# add all jobs to table
+		while IFS='|' read -r id stage name started_at status duration; do
+			status=${!status}
+			table_rows+="$name"$'\t'"$status"$'\t'"$duration"$'\t'"${github_job_url_prefix}${id}"$'\n'
+		done <<< "$jobs_saved"
+
+		# remove trailing newline
+		table_rows="${table_rows%$'\n'}"
+
+		# table mode
+		if [[ "$display_table" == "true" ]]; then
+
+			# clear table if debug_mode off and not first run
+			if ((!debug_mode)) && ((!first_run)); then
+				tput cuu $((jobs_amount + 4))
+			fi
+
+			# print table
+			print_table "$table_rows"
+
+		# column mode
+		else
+			# clear table if debug_mode off and not first run
+			if ((!debug_mode)) && ((!first_run)); then
+				tput cuu $((jobs_amount + 1))
+			fi
+
+			# print columns
+			print_columns "$table_rows"
+		fi
+	fi
+
+	return "$pipeline_running"
+}
+
+function run_github_project {
+
+	dcho "running run_github_project"
+
+	get_remote_origin_url		# get git remote origin url
+	get_github_project_id		# get github project
+	get_github_pipeline_id		# get current branch workflow run
+	get_github_commit_info		# get github commit info
+
+	# display branch info
+	if [[ "$display_gitinfo" == "true" ]]; then
+		echo " ${commit_branch_message}: $commit_branch"
+		echo " ${commit_title_message}: $commit_short_id \"$commit_title\""
+		echo " ${commit_author_message}: $commit_author"
+		echo " ${commit_pushed_message}: $commit_pushed ago"
+		echo " ${commit_status_message}: $commit_status"
+	fi
+
+	# display pipeline url
+	if [[ "$display_link" == "true" ]]; then
+		[[ -z "$github_pipeline_url" ]] && get_github_pipeline_url
+		echo " $url_message: $github_pipeline_url"
+	fi
+
+	local pipeline_running=""
+
+	# if display_monitor enabled monitor jobs
+	if [[ "$display_monitor" == "true" ]]; then
+
+		# initial run
+		monitor_github_pipeline
+		pipeline_running=$?
+
+		# loop untill jobs are running
+		while ((pipeline_running)) && [[ "$display_once" == "false" ]]; do
+			sleep "$update_interval"	# sleep
+			monitor_github_pipeline		# consecutive runs
+			pipeline_running=$?
+		done
+	fi
+
+	# done message and notify
+	if ((!pipeline_running)); then
+
+		echo " $done_message"
+
+		if [[ "$exit_status" == "failure" ]]; then
+			send_notification "❌ Pipeline failed"
+		else
+			send_notification "✅ Pipeline passed"
+		fi
+
+		# get github_pipeline_url if missing
+		[[ -z "$github_pipeline_url" ]] && get_github_pipeline_url
+		open_url "$github_pipeline_url"
+	fi
+}
+
+### GitLab functions
+
+function get_gitlab_pipeline_url {
+
+	dcho "running get_gitlab_pipeline_url"
+
+	# get remote_origin_url if missing
+	[[ -z "$remote_origin_url" ]] && get_remote_origin_url
+
+	# get gitlab_pipeline_id if missing
+	[[ -z "$gitlab_pipeline_id" ]] && get_gitlab_pipeline_id
+
+	# define gitlab_pipeline_url
+	gitlab_pipeline_url="https://gitlab.com/$remote_origin_url/-/pipelines/$gitlab_pipeline_id"
+
+	dcho "gitlab_pipeline_url set: '$gitlab_pipeline_url'"
+}
+
+function get_gitlab_project_id {
+
+	dcho "running get_gitlab_project_id"
+
+	# if remote_origin_url not defined, get it first
+	if [[ -z "$remote_origin_url" ]]; then
+		get_remote_origin_url
+	fi
+
+	# encode remote_origin_url
+	encoded_remote_origin_url=$(echo "${remote_origin_url//\//%2F}")
+	dcho "encoded_remote_origin_url: $encoded_remote_origin_url"
+
+	# curl project
+	local project_json=$(curl -s --header "PRIVATE-TOKEN: $token" "https://gitlab.com/api/v4/projects/$encoded_remote_origin_url")
+
+	# parse project_id from json
+	gitlab_project_id=$(echo "$project_json" | jq -r '.id // ""')
+
+	# check if project_id found
+	if [[ -z "$gitlab_project_id" ]]; then
+
+		# show json error message and throw error
+		local json_error=$(echo "$project_json" | jq -r '.message')
+		err "project json curl error: '$json_error'"
+	fi
+
+	dcho "project id found '$gitlab_project_id'"
+}
+
+function get_gitlab_pipeline_id {
+
+	dcho "running get_gitlab_pipeline_id"
+
+	# if branch is none, get active branch
+	[[ "$branch" == "@" ]] && set_active_branch
+
+	# get gitlab_project_id if missing
+	if [[ -z "$gitlab_project_id" ]]; then
+		get_gitlab_project_id
+	fi
+
+	# curl latest pipeline
+	gitlab_pipeline_json=$(curl -s --header "PRIVATE-TOKEN: $token" "https://gitlab.com/api/v4/projects/$gitlab_project_id/pipelines?ref=$branch&per_page=1")
+
+	# parse gitlab_pipeline_id
+	gitlab_pipeline_id=$(echo "$gitlab_pipeline_json" | grep -o '"id":[0-9]*' | sed 's/"id"://')
+
+	# check if pipeline id found
+	if [[ -z "$gitlab_pipeline_id" || "$gitlab_pipeline_id" == "null" ]]; then
+		err "no pipeline id found for branch '$branch'"
+	fi
+
+	dcho "gitlab_pipeline_id set: '$gitlab_pipeline_id'"
+
+	# define gitlab_url_prefix
+	gitlab_url_prefix="https://gitlab.com/$remote_origin_url/-/"
+}
+
+function get_gitlab_commit_info {
+
+	dcho "running get_gitlab_commit_info"
+
+	# get pipeline status and commit info
+	local commit_json=$(curl -s --header "PRIVATE-TOKEN: $token" "https://gitlab.com/api/v4/projects/$gitlab_project_id/pipelines/$gitlab_pipeline_id/jobs?per_page=1" 2>/dev/null | jq '.[0] | {commit, pipeline: {status: .pipeline.status}, ref}' 2>/dev/null)
+
+	commit_branch=$(echo "$commit_json" | jq -r '.ref' 2>/dev/null)
+	commit_short_id=$(echo "$commit_json" | jq -r '.commit.short_id' 2>/dev/null)
+	commit_title=$(echo "$commit_json" | jq -r '.commit.title' 2>/dev/null)
+	commit_author=$(echo "$commit_json" | jq -r '.commit.author_name' 2>/dev/null)
+	commit_created=$(echo "$commit_json" | jq -r '.commit.created_at' 2>/dev/null)
+	commit_status=$(echo "$commit_json" | jq -r '.pipeline.status' 2>/dev/null)
+
+	local commit_timestamp=""
+
+	# define commit_timestamp based on os
+	if [[ "$os_name" == "Darwin" ]]; then
+		commit_timestamp=$(date -jf "%Y-%m-%dT%H:%M:%S" "${commit_created:0:19}" +%s 2>/dev/null)
+	elif [[ "$os_name" == "Linux" ]]; then
+		commit_timestamp=$(date -d "$commit_created" +%s 2>/dev/null)
+	else
+		err "unknown os name '$os_name'"
+	fi
+
+	# get elapsed time in seconds and format
+	local seconds=$(($(date +%s) - commit_timestamp))
+	commit_pushed=$(format_duration "$seconds")
+}
+
+function gitlab_pipeline_init {
+
+	dcho "running gitlab_pipeline_init"
+
+	# running jobs counter
+	local pipeline_running=0
+
+	# jobs json
+	local jobs_json=$(curl -s --header "PRIVATE-TOKEN: $token" "https://gitlab.com/api/v4/projects/$gitlab_project_id/pipelines/$gitlab_pipeline_id/jobs" | jq '[.[] | {id, stage, name, created_at, status, duration}]' 2>/dev/null)
+
+	dcho "jobs_json: '$jobs_json'"
+
+	# job count
+	jobs_amount=$(echo "$jobs_json" | jq 'length' 2>/dev/null)
+
+	# parse json data
+	while IFS=$'\t' read -r id stage name created_at status duration; do
+
+		# format duration
+		duration=$(format_duration "$duration")
+
+		# check if any job is running
+		[[ "/$running_statuses/" == *"/$status/"* ]] && pipeline_running=1
+
+		# format job
+		local job="$id|$stage|$name|$created_at|$status|$duration"
+
+		# save job to jobs_saved array
+		jobs_saved+="${job}\n"
+
+		# add emoji of job status to emoji_list if small_mode is enabled
+		if [[ "$display_small" ]]; then
+			emoji_var="emoji_${status}"
+			emoji_list="${!emoji_var}${emoji_list}"
+		fi
+
+	done < <(echo "$jobs_json" | jq -r '.[] | [.id, .stage, .name, .created_at, .status, .duration] | @tsv' 2>/dev/null)
+
+	# sort jobs by created_at (4th field)
+	jobs_saved=$(eche "$jobs_saved" | sort -t'|' -k4,4)
+
+	# remove trailing newline
+	jobs_saved="${jobs_saved#$'\n'}"
+
+	# get pipeline status
+	exit_status=$(curl -s --header "PRIVATE-TOKEN: $token" \
+		"https://gitlab.com/api/v4/projects/$gitlab_project_id/pipelines/$gitlab_pipeline_id" | \
+		jq -r '.status')
+
+	return $pipeline_running
+}
+
+function gitlab_pipeline_update {
+
+	dcho "running gitlab_pipeline_update"
+
+	# reset jobs running counter
+	local pipeline_running=0
+
+	# temporary new saved jobs var
+	local new_jobs_saved=""
+
+	# get jobs json
+	local jobs_json=$(curl -s --header "PRIVATE-TOKEN: $token" "https://gitlab.com/api/v4/projects/$gitlab_project_id/pipelines/$gitlab_pipeline_id/jobs" | jq '[.[] | {id, status, duration}]' 2>/dev/null)
+
+	dcho "jobs_json: '$jobs_json'"
+
+	# parse json data (id and changing fields; status and duration)
+	while IFS=$'\t' read -r job_id job_status job_duration; do
+
+		# format duration
+		job_duration=$(format_duration "$job_duration")
+
+		# check if any job is running
+		[[ "/$running_statuses/" == *"/$job_status/"* ]] && pipeline_running=1
+
+		# get old saved job for current id
+		old_job=$(echo "$jobs_saved" | grep "^$job_id|")
+
+		# remove last 2 fields (status and duration)
+		old_job="${old_job%|*|*}"
+
+		# rebuild with new status and duration
+		new_job="$old_job|$job_status|$job_duration"
+
+		# save job with new values in new_jobs_saved
+		if [[ -z "$new_jobs_saved" ]]; then
+			new_jobs_saved="${new_job}"
+		else
+			new_jobs_saved+=$'\n'"${new_job}"
+		fi
+
+	done < <(echo "$jobs_json" | jq -r '.[] | [.id, .status, .duration] | @tsv' 2>/dev/null)
+
+	# update jobs_saved
+	jobs_saved="$new_jobs_saved"
+
+	# sort jobs
+	jobs_saved=$(eche "$jobs_saved" | sort -t'|' -k4,4)
+
+	# add emoji of job status to emoji_list if small_mode is enabled
+	if [[ "$display_small" == "true" || "$notify" == "true" ]]; then
+		emoji_var="emoji_${status}"
+		emoji_list="${!emoji_var}${emoji_list}"
+	fi
+
+	# get pipeline status
+	exit_status=$(curl -s --header "PRIVATE-TOKEN: $token" \
+		"https://gitlab.com/api/v4/projects/$gitlab_project_id/pipelines/$gitlab_pipeline_id" | \
+		jq -r '.status')
+
+	return "$pipeline_running"
+}
+
+function monitor_gitlab_pipeline {
+
+	local first_run=0
+	local pipeline_running=0
+
+	# if jobs_saved is empty set first_run flag
+	if [[ ${#jobs_saved[@]} -eq 0 ]]; then
+		first_run=1
+	fi
+
+	dcho "running monitor_gitlab_pipeline"
+
+	# if first run
+	if ((first_run)); then
+
+		# get initial gitlab jobs data
+		gitlab_pipeline_init
+	else
+		# update gitlab jobs data
+		gitlab_pipeline_update
+	fi
+
+	pipeline_running=$?
+
+	# add header to table
+	table_rows="Stage"$'\t'"Name"$'\t'"Status"$'\t'"Duration"$'\t'"URL"$'\n'
+
+	# display_small mode
+	if [[ "$display_small" == "true" ]]; then
+
+		# clear single line
+		if ((!debug_mode)) && ((!first_run)); then
+			tput cuu 1
+		fi
+
+		# show single line job list
+		echo " $jobs_message: $emoji_list"
+
+	# normal mode
+	else
+
+		# add all jobs to table
+		while IFS='|' read -r id stage name created_at status duration; do
+			status=${!status}
+			table_rows+="$stage"$'\t'"$name"$'\t'"$status"$'\t'"$duration"$'\t'"https://gitlab.com/$remote_origin_url/-/jobs/${id}"$'\n'
+		done <<< "$jobs_saved"
+
+		# remove trailing newline
+		table_rows="${table_rows%$'\n'}"
+
+		# table mode
+		if [[ "$display_table" == "true" ]]; then
+
+			# clear table if debug_mode off and not first run
+			if ((!debug_mode)) && ((!first_run)); then
+				tput cuu $((jobs_amount + 4))
+			fi
+
+			# print table
+			print_table "$table_rows"
+
+		# column mode
+		else
+			# clear table if debug_mode off and not first run
+			if ((!debug_mode)) && ((!first_run)); then
+				tput cuu $((jobs_amount + 1))
+			fi
+
+			# print columns
+			print_columns "$table_rows"
+		fi
+	fi
+
+	return "$pipeline_running"
+}
+
+function run_gitlab_project {
+
+	dcho "running run_gitlab_project"
+
+	get_remote_origin_url	# get git remote origin url
+	get_gitlab_project_id	# get gitlab project
+	get_gitlab_pipeline_id	# get current branch pipeline
+	get_gitlab_commit_info	# get gitlab commit info
+
+	# display branch info
+	if [[ "$display_gitinfo" == "true" ]]; then
+		echo " ${commit_branch_message}: $commit_branch"
+		echo " ${commit_title_message}: $commit_short_id \"$commit_title\""
+		echo " ${commit_author_message}: $commit_author"
+		echo " ${commit_pushed_message}: $commit_pushed ago"
+		echo " ${commit_status_message}: $commit_status"
+	fi
+
+	# display pipeline url
+	if [[ "$display_link" == "true" ]]; then
+		[[ -z "$gitlab_pipeline_url" ]] && get_gitlab_pipeline_url
+		echo " $url_message: $gitlab_pipeline_url"
+	fi
+
+	local pipeline_running=""
+
+	# if display_monitor enabled monitor jobs
+	if [[ "$display_monitor" == "true" ]]; then
+
+		# initial run
+		monitor_gitlab_pipeline
+		pipeline_running=$?
+
+		# loop untill jobs are running
+		while ((pipeline_running)) && [[ "$display_once" == "false" ]]; do
+			sleep "$update_interval"	# sleep
+			monitor_gitlab_pipeline		# consecutive runs
+			pipeline_running=$?
+		done
+	fi
+
+	# done message and notify
+	if ((!pipeline_running)); then
+
+		echo " $done_message"
+
+		if [[ "$exit_status" == "failed" ]]; then
+			send_notification "❌ Pipeline failed"
+		else
+			send_notification "✅ Pipeline passed"
+		fi
+
+		# get gitlab_pipeline_url if missing
+		[[ -z "$gitlab_pipeline_url" ]] && get_gitlab_pipeline_id
+		open_url "$gitlab_pipeline_url"
+	fi
+}
+
+### shared project functions
+
+function get_remote_origin_url {
+
+	dcho "running get_remote_origin_url"
+
+	# check if '.git' exists
+	if [[ ! -d "$directory/.git" ]]; then
+		err "'.git' not found in directory '$directory'"
+	fi
+
+	# get remote_origin_url
+	remote_origin_url=$(git -C $directory config --get remote.origin.url)
+
+	dcho "remote_origin_url: $remote_origin_url"
+
+	# check if empty
+	if [[ -z "$remote_origin_url" ]]; then
+		err "git origin url empty"
+
+	# check if starts with 'git@host:'
+	elif [[ "$remote_origin_url" == git@* ]]; then
+		# remove 'git@host:'
+		remote_origin_url="${remote_origin_url#*:}"
+
+	# check if starts with 'https://'
+	elif [[ "$remote_origin_url" == https://* ]]; then
+		# remove 'https://' and 'hostname/'
+		remote_origin_url="${remote_origin_url#https://}"
+		remote_origin_url="${remote_origin_url#*/}"
+
+	# invalid origin url
+	else
+		err "git origin url not valid: '$remote_origin_url'"
+	fi
+
+	# remove trailing '.git'
+	remote_origin_url="${remote_origin_url%.git}"
+
+	dcho "remote_origin_url set: '$remote_origin_url'"
+}
+
+function get_project_by_name {
+
+	dcho "running get_project_by_name"
+
+	# if name missing throw error
+	[[ ! "$name" ]] && err "no project name passed"
+
+	# all the project fields of project with name
+	local project_lines=$(grep -A4 "^\\[$name\\]$" "$projects_file")
+	local directory=""
+	local platform=""
+	local token=""
+	local branch=""
+
+	# if name not found return 1
+	[[ ! "$project_lines" ]] && return 1
+
+	# check for empty lines
+	[[ $(echo "$project_lines" | grep '^$') ]] && err "corrupt projects file '$projects_file', found empty lines after name '$name', manually fix file with 'cight edit projects'"
+
+	# loop over fields
+	while IFS= read -r line; do
+
+		# parse directory
+		if [[ "$line" == "dir = "* ]]; then
+			directory="${line#dir = }"
+
+		# parse platform
+		elif [[ "$line" == "platform = "* ]]; then
+			platform="${line#platform = }"
+
+		# parse token
+		elif [[ "$line" == "token = "* ]]; then
+			token="${line#token = }"
+
+		# parse branch
+		elif [[ "$line" == "branch = "* ]]; then
+			branch="${line#branch = }"
+		fi
+
+	done <<< "$project_lines"
+
+	eche "$directory"$'\t'"$platform"$'\t'"$token"$'\t'"$branch"
+}
+
+function set_project_by_name {
+
+	dcho "running set_project_by_name"
+
+	# throw error if name empty
+	[[ ! "$name" ]] && err "no project name passed"
+
+	# project lines of project with name
+	local project_lines=$(grep -A4 "^\\[$name\\]$" "$projects_file")
+
+	# throw error if project lines empty
+	if [[ ! "$project_lines" ]]; then
+		err "project with name '$name' not found"
+	fi
+
+	# check for empty lines
+	[[ $(echo "$project_lines" | grep '^$') ]] && err "corrupt projects file '$projects_file', found empty lines after name '$name', manually fix file with 'cight edit projects'"
+
+	# loop over lines in project_lines
+	while IFS= read -r line; do
+
+		# parse directory
+		if [[ "$line" == "dir = "* ]]; then
+			directory="${line#dir = }"
+
+		# parse platform
+		elif [[ "$line" == "platform = "* ]]; then
+			platform="${line#platform = }"
+
+		# parse token
+		elif [[ "$line" == "token = "* ]]; then
+			token="${line#token = }"
+
+		# parse branch
+		elif [[ "$line" == "branch = "* ]]; then
+			branch="${line#branch = }"
+		fi
+
+	done <<< "$project_lines"
+}
+
+function set_project_by_directory {
+
+	dcho "running set_project_by_directory"
+
+	local dir="$directory"
+	[[ ! "$dir" ]] && dir=$(pwd)	# set current working directory if directory empty
+	dir=$(realpath "${dir%/}")	# remove trailing '/' from directory
+
+	# find all projects in directory
+	local names=()
+	while IFS= read -r line; do
+		name=$(echo "$line" | sed 's/\[//;s/\]//')
+		names+=("$name")
+	done < <(grep -x "dir = $dir" "$projects_file" -B1 | grep "^\[")
+
+	# if single project in directory
+	if (( ${#names[@]} == 1 )); then
+		name="${names[0]}"
+		set_project_by_name "$name"
+		return $?
+
+	# if no projects in directory
+	elif (( ${#names[@]} == 0 )); then
+		return 1
+	fi
+
+	# multiple projects in directory
+	echo "found ${#names[@]} projects in directory '$dir'"
+	echo ""
+
+	# add header to table
+	local table="Nr"$'\t'"Name"$'\t'"Platform"$'\t'"Branch"$'\t'"Token"$'\n'
+
+	local counter=0
+
+	# loop over all project names
+	IFS=$'\t'; for name in "${names[@]}"; do
+		((counter++))
+
+		# get project by name and add to table
+		IFS=$'\t' read -r dir platform token branch <<< "$(get_project_by_name "$name")"
+		token="...${token: -5}"
+		table+="$counter)"$'\t'"$name"$'\t'"$platform"$'\t'"$branch"$'\t'"$token"$'\n'
+	done
+
+	print_columns "$table"
+	local choice=$(ask " select project by number or by name: ")
+
+	while :; do
+
+		dcho "choice: '$choice'"
+
+		# check if choice is in names array
+		for n in "${names[@]}"; do
+			if [[ "$choice" == "$n" ]]; then
+				name="$choice"
+				break 2
+			fi
+		done
+
+		# if input valid index
+		if [[ $choice =~ ^[0-9]+$ ]] && (( choice > 0 && choice <= ${#names[@]} )); then
+			name=${names[(($choice-1))]}
+			break
+		fi
+
+		clear_line
+		choice=$(ask " invalid input '$choice', enter number or name: ")
+	done
+
+	clear_line $((counter + 5))
+
+	set_project_by_name "$name"
+
+	return 0
+}
+
+function set_active_branch {
+
+	dcho "running set_active_branch"
+
+	# remove trailing '/' from directory
+	local directory=$(realpath "${directory%/}")
+
+	# check if directory exists
+	if [[ ! -d "$directory" ]]; then
+		err "directory '$directory' does not exist"
+	fi
+
+	# check if '.git' exists
+	if [[ ! -d "$directory/.git" ]]; then
+		err "'.git' file doe not exist in '$directory'"
+	fi
+
+	# get branch
+	branch=$(git -C "$directory" rev-parse --abbrev-ref HEAD 2>/dev/null)
+
+	# check if branch exists
+	if [[ $? -ne 0 || -z "$branch" ]]; then
+		err "no branch detected in directory '$directory'"
+	fi
+
+	dcho "branch found '$branch'"
+}
+
+function set_project_variables {
+
+	# if name defined
+	if [[ -n "$name" ]]; then
+
+		# set project by name
+		set_project_by_name "$name"
+
+	# if name not defined
+	else
+
+		# set project by directory
+		set_project_by_directory "$directory"
+	fi
+}
+
+function run_project {
+
+	# set active branch if branch is '@'
+	[[ "$branch" == "@" ]] && set_active_branch
+
+	case "$platform" in
+		github)		run_github_project ;;
+		gitlab)		run_gitlab_project ;;
+		*)		err "invalid platform '$platform'" ;;
+	esac
+}
+
+### main function
+
+function main {
+
+	disable_input				# disable input
+	check_requirements			# check if requirements are installed
+	check_files				# check if files exist with right permissions
+	source "$global_config_file"		# load user's global config file
+
+	# load project config file
+	if [[ "$directory" && -d "$directory/$project_config_file" ]]; then
+		source "$directory/$project_config_file"
+	fi
+
+	parse_arguments "$@"			# parse command line arguments
+	show_program_state			# post argument parse program state
+	aestheticize				# clear screen and enable colors and emojis
+
+	[[ ! "$mode" ]] && mode="run"		# set mode to run if none passed
+
+	case "$mode" in
+
+		run)
+			set_project_variables		# set project variables by name or directory
+			[[ $? -ne 0 ]] && add_project	# if project_variables set add project
+			run_project			# run project
+			;;
+		add)
+			add_project			# add new project
+			run_project			# run project
+			;;
+
+		list)
+			list_projects			# list all projects
+			;;
+
+		open)
+			set_project_variables		# set project variables
+			
+			case "$platform" in		# check project platform
+				"github")
+					get_github_pipeline_url
+					open_url "$github_pipeline_url"
+					;;
+				"gitlab")
+					get_gitlab_pipeline_url
+					open_url "$gitlab_pipeline_url"
+					;;
+				*)
+					err "unknown platform '$platform'"
+					;;
+			esac
+			echo "opening pipeline url in browser"
+			;;
+		*)
+			err "unknown program mode '$mode'"
+			;;
+
+	esac
+}
+
+main "$@"
+
+# CO3 2324
