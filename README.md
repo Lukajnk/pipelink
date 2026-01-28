@@ -1,6 +1,6 @@
 # Cight
 
-Monitor your CI/CD pipelines from the terminal.
+Monitor your CI/CD pipelines from the terminal
 
 ![Demo](https://raw.githubusercontent.com/Lukajnk/cight/main/media/cight_demo.gif)
 
@@ -17,15 +17,20 @@ Monitor your CI/CD pipelines from the terminal.
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Lukajnk/cight/v1.0.0/install.sh -o cight_install.sh
 less cight_install.sh
-bash cight_install.sh    
+bash cight_install.sh
 rm cight_install.sh
 ```
 
-Run with `sudo bash install.sh` for system wide install
+Run with `sudo bash cight_install.sh` for system wide installation
 
-### One-liner
+### One-line installer
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Lukajnk/cight/v1.0.0/install.sh)
+curl -fsSL https://raw.githubusercontent.com/Lukajnk/cight/v1.0.0/install.sh | bash
+```
+
+### Or with sudo for system wide installation
+```bash
+curl -fsSL https://raw.githubusercontent.com/Lukajnk/cight/v1.0.0/install.sh | sudo bash
 ```
 
 ## Dependencies
