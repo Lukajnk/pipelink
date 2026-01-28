@@ -12,7 +12,7 @@ if [[ -n "$SUDO_USER" ]]; then
 	[[ -d "$install_directory" ]] || { echo "error: directory '$install_directory' missing, exiting" ; exit 1; }
 
 	echo "cight will be installed in '$install_directory' and usable by all users, to install for current user only run script without sudo"
-	read -r -p "continue install? [y/N]: " user_choice
+	read -r -p "continue install? [y/N]: " user_choice < /dev/tty
 	case "$user_choice" in
 		[Yy][Ee][Ss]|[Yy]) ;;
 		*) echo "aborting installation" ; exit 1 ;;
@@ -26,10 +26,15 @@ else
 
 	echo "cight will be installed in '$install_directory' and usable by current user only, to install for all users run script with sudo"
 
-	read -r -p "continue install? [y/N]: " user_choice
+	read -r -p "continue install? [y/N]: " user_choice < /dev/tty
+
 	case "$user_choice" in
-		[Yy][Ee][Ss]|[Yy]) ;;
-		*) echo "aborting installation" ; exit 1 ;;
+		[Yy][Ee][Ss]|[Yy])
+			;;
+		*)
+			echo "aborting installation"
+			exit 1
+			;;
 	esac
 
 	mkdir -p "$install_directory" || { echo "error: failed to make directory '$install_directory', exiting" ; exit 1; }
